@@ -1,0 +1,14 @@
+{
+  "name": "RépétiPro — Tes élèves, tes paiements, zéro oubli.",
+  "short_name": "RépétiPro",
+  "description": "Gestion des répétitions, des échéances et des paiements pour répétiteurs. Fonctionne hors ligne.",
+  "lang": "fr",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#F4F7F9",
+  "theme_color": "#0F2A43",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}
