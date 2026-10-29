@@ -8,10 +8,11 @@ const nowISO = () => new Date().toISOString();
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const MOYENS = { especes: "Espèces", mobile_money: "Mobile Money", virement: "Virement", autre: "Autre" };
 const CYCLES = { primaire: "Primaire", college: "Collège", lycee: "Lycée" };
+const STATUTS_SEANCE = { prevue: "Prévue", faite: "Faite (présent)", absent: "Absent", annulee: "Annulée" };
 
 /* ---------------- IndexedDB ---------------- */
-const DB_NAME = "repetipro", DB_VERSION = 1;
-const STORES = ["eleves", "repetitions", "periodes", "paiements", "recus", "syncops", "meta"];
+const DB_NAME = "repetipro", DB_VERSION = 2;
+const STORES = ["eleves", "repetitions", "periodes", "paiements", "recus", "seances", "syncops", "meta"];
 let db = null;
 function openDB() {
   return new Promise((res, rej) => {
@@ -40,13 +41,13 @@ async function putOne(store, obj) { await tx([store], "readwrite", (s) => s.put(
 async function getOne(store, id) { return await tx([store], "readonly", (s) => reqP(s.get(id))); }
 
 /* ---------------- État + paramètres ---------------- */
-let S = { eleves: [], repetitions: [], periodes: [], paiements: [], recus: [], syncops: [] };
+let S = { eleves: [], repetitions: [], periodes: [], paiements: [], recus: [], seances: [], syncops: [] };
 let settings = { id: "settings", activite: "", slogan: "", telephone: "", coordonnees: "", devise: "FCFA", formatRecu: "A4",
   notifAvant: true, notifJourJ: true, notifApres: true, delaiApres: 2, rappelsVus: [] };
 let currentView = "dashboard", currentEleveId = null, filtreEcheance = "aujourdhui", submitting = false;
 
 async function reload() {
-  for (const k of ["eleves", "repetitions", "periodes", "paiements", "recus", "syncops"]) S[k] = await allOf(k);
+  for (const k of ["eleves", "repetitions", "periodes", "paiements", "recus", "seances", "syncops"]) S[k] = await allOf(k);
   const st = await getOne("meta", "settings");
   if (st) settings = Object.assign(settings, st);
 }
@@ -134,6 +135,8 @@ function renderDashboard() {
   const retard = calcs.filter((c) => c.statut === "en_retard" || c.statut === "partiel_en_retard");
   const montantRetard = retard.reduce((a, c) => a + Math.max(0, c.solde), 0);
   const annules = S.paiements.filter((p) => p.statut === "annule").reduce((a, p) => a + p.montant, 0);
+  const dans7 = L.addDays(jour, 7);
+  const prochainesSeances = S.seances.filter((s) => s.statut === "prevue" && s.date >= jour).sort((a, b) => (a.date + (a.heure || "")).localeCompare(b.date + (b.heure || "")));
   $("#kpis").innerHTML = [
     ["Élèves actifs", S.eleves.filter((e) => e.statut === "actif").length, ""],
     ["Élèves archivés", S.eleves.filter((e) => e.statut === "archive").length, ""],
@@ -142,6 +145,7 @@ function renderDashboard() {
     ["Échéances aujourd'hui", calcs.filter((c) => c.statut === "aujourd_hui").length, "attente"],
     ["En retard", retard.length + " — " + fmt(montantRetard), "alerte"],
     ["Paiements annulés (non comptés)", fmt(annules), ""],
+    ["Séances prévues (7 jours)", prochainesSeances.filter((s) => s.date <= dans7).length, ""],
   ].map(([l, v, c]) => `<div class="kpi ${c}"><div class="v">${v}</div><div class="l">${l}</div></div>`).join("");
   const prochaines = calcs.filter((c) => !["payee", "annulee", "suspendue"].includes(c.statut))
     .sort((a, b) => a.periode.dateEcheance.localeCompare(b.periode.dateEcheance)).slice(0, 5);
@@ -150,6 +154,8 @@ function renderDashboard() {
   const derniers = [...S.paiements].sort((a, b) => b.datePaiement.localeCompare(a.datePaiement)).slice(0, 5);
   $("#dashPaiements").innerHTML = derniers.length ? derniers.map(lignePaiement).join("")
     : emptyState("💰", "Aucun paiement enregistré", "Les encaissements réels apparaîtront ici. Une simple échéance n'est jamais comptée comme une recette.");
+  $("#dashSeances").innerHTML = prochainesSeances.length ? prochainesSeances.slice(0, 5).map(ligneSeance).join("")
+    : emptyState("📚", "Aucune séance prévue", "Planifiez une séance depuis la fiche d'un élève, section « Séances & suivi pédagogique ».");
   bindRowActions($("#view-dashboard"));
 }
 function ligneEcheance(c) {
@@ -179,7 +185,7 @@ function renderEleves() {
   const q = ($("#rechercheEleve").value || "").toLowerCase();
   const cycle = $("#filtreCycle").value, statut = $("#filtreStatut").value, sit = $("#filtrePaiement").value;
   let liste = S.eleves.filter((e) =>
-    (!q || (e.nomComplet + " " + e.classe + " " + (e.telephone || "")).toLowerCase().includes(q)) &&
+    (!q || (e.nomComplet + " " + e.classe + " " + (e.telephone || "") + " " + (e.telephoneParent || "") + " " + (e.parent || "")).toLowerCase().includes(q)) &&
     (!cycle || e.cycle === cycle) && (!statut || e.statut === statut) &&
     (!sit || situationEleve(e.id) === sit));
   liste.sort((a, b) => a.nomComplet.localeCompare(b.nomComplet, "fr"));
@@ -197,20 +203,25 @@ function renderEleves() {
   bindRowActions($("#view-eleves"));
 }
 function formEleve(eleve) {
-  const e = eleve || { nomComplet: "", classe: "", cycle: "college", etablissement: "", parent: "", telephone: "", matieres: "", tarifMensuel: "", dateDebut: L.todayISO(), notes: "" };
+  const e = eleve ? { ...eleve } : { nomComplet: "", nom: "", prénom: "", classe: "", cycle: "college", etablissement: "", parent: "", telephone: "", telephoneParent: "", matieres: "", tarifMensuel: "", dateDebut: L.todayISO(), frequenceSeances: "", observationsPedagogiques: "", notes: "" };
+  if (eleve && !e.prénom && !e.nom && e.nomComplet) { const parties = e.nomComplet.trim().split(/\s+/).filter(Boolean); e.prénom = parties[0] || ""; e.nom = parties.slice(1).join(" "); }
   openModal(eleve ? "Modifier l'élève" : "Nouvel élève", `
   <form id="fEleve" class="stack">
     <div id="fEleveErr"></div>
-    <label class="field">Nom complet *<input name="nomComplet" class="input" required value="${esc(e.nomComplet)}"></label>
+    <label class="field">Prénom *<input name="prenomEleve" class="input" required value="${esc(e.prénom || "")}"></label>
+    <label class="field">Nom de famille *<input name="nomFamilleEleve" class="input" required value="${esc(e.nom || "")}"></label>
     <label class="field">Classe / niveau *<input name="classe" class="input" required value="${esc(e.classe)}" placeholder="Ex : 3e, Terminale D, CM2…"></label>
     <label class="field">Cycle *<select name="cycle" class="input">
       ${Object.entries(CYCLES).map(([k, v]) => `<option value="${k}" ${e.cycle === k ? "selected" : ""}>${v}</option>`).join("")}</select></label>
     <label class="field">Établissement (facultatif)<input name="etablissement" class="input" value="${esc(e.etablissement || "")}"></label>
     <label class="field">Parent / tuteur (facultatif)<input name="parent" class="input" value="${esc(e.parent || "")}"></label>
-    <label class="field">Téléphone (facultatif)<input name="telephone" class="input" inputmode="tel" value="${esc(e.telephone || "")}"></label>
+    <label class="field">Téléphone de contact (facultatif)<input name="telephone" class="input" inputmode="tel" value="${esc(e.telephone || "")}"></label>
+    <label class="field">Téléphone du parent / tuteur (facultatif)<input name="telephoneParent" class="input" inputmode="tel" value="${esc(e.telephoneParent || "")}"></label>
     <label class="field">Matière(s) (facultatif, séparées par des virgules)<input name="matieres" class="input" value="${esc(e.matieres || "")}" placeholder="Mathématiques, Physique"></label>
     <label class="field">Tarif mensuel convenu (${esc(settings.devise)}, entier)<input name="tarifMensuel" class="input" inputmode="numeric" value="${e.tarifMensuel === "" || e.tarifMensuel == null ? "" : e.tarifMensuel}" placeholder="Ex : 25000"></label>
     <label class="field">Date de début<input name="dateDebut" class="input" type="date" value="${esc(e.dateDebut || "")}"></label>
+    <label class="field">Fréquence des séances (ex : 2×/semaine, mar. & sam.)<input name="frequenceSeances" class="input" value="${esc(e.frequenceSeances || "")}"></label>
+    <label class="field">Observations pédagogiques<textarea name="observationsPedagogiques" class="input" rows="2">${esc(e.observationsPedagogiques || "")}</textarea></label>
     <label class="field">Notes privées<textarea name="notes" class="input" rows="2">${esc(e.notes || "")}</textarea></label>
     ${!eleve ? `<label class="check"><input type="checkbox" name="creerRepetition" checked> Créer aussi la répétition + la 1ʳᵉ période (échéance = début + 1 mois)</label>` : ""}
     <button class="btn btn-primary" type="submit">${eleve ? "Enregistrer" : "Ajouter l'élève"}</button>
@@ -219,12 +230,17 @@ function formEleve(eleve) {
     ev.preventDefault();
     const f = new FormData(ev.target);
     const tarifBrut = (f.get("tarifMensuel") || "").toString().trim();
-    const data = { nomComplet: f.get("nomComplet").trim(), classe: f.get("classe").trim(), cycle: f.get("cycle"),
+    const prenomF = f.get("prenomEleve").trim(), nomF = f.get("nomFamilleEleve").trim();
+    const data = { nom: nomF, prénom: prenomF, nomComplet: (prenomF + " " + nomF).trim(), classe: f.get("classe").trim(), cycle: f.get("cycle"),
       etablissement: f.get("etablissement").trim(), parent: f.get("parent").trim(), telephone: f.get("telephone").trim(),
+      telephoneParent: f.get("telephoneParent").trim(),
       matieres: f.get("matieres").trim(), tarifMensuel: tarifBrut === "" ? null : Number(tarifBrut),
-      dateDebut: f.get("dateDebut") || L.todayISO(), notes: f.get("notes").trim() };
+      dateDebut: f.get("dateDebut") || L.todayISO(), frequenceSeances: f.get("frequenceSeances").trim(),
+      observationsPedagogiques: f.get("observationsPedagogiques").trim(), notes: f.get("notes").trim() };
     if (tarifBrut !== "" && !/^\d+$/.test(tarifBrut)) data.tarifMensuel = NaN;
     const errs = L.validerEleve(data);
+    if (!prenomF) errs.push("Le prénom est obligatoire.");
+    if (!nomF) errs.push("Le nom de famille est obligatoire.");
     if (!eleve && f.get("creerRepetition") && (!data.matieres || data.tarifMensuel == null || !(data.tarifMensuel >= 0)))
       errs.push("Pour créer la 1ʳᵉ période, indiquez au moins une matière et un tarif mensuel.");
     if (errs.length) { $("#fEleveErr").innerHTML = erreursHtml(errs); return; }
@@ -260,6 +276,8 @@ function renderFiche() {
   const paiesEleve = S.paiements.filter((p) => { const per = S.periodes.find((x) => x.id === p.periodeId); return per && contextePeriode(per).eleve?.id === e.id; })
     .sort((a, b) => b.datePaiement.localeCompare(a.datePaiement));
   const recusEleve = S.recus.filter((r) => r.snapshot.eleveId === e.id).sort((a, b) => b.dateGeneration.localeCompare(a.dateGeneration));
+  const seancesEleve = S.seances.filter((s) => s.eleveId === e.id).sort((a, b) => (b.date + (b.heure || "")).localeCompare(a.date + (a.heure || "")));
+  const statsS = L.statsSeances(seancesEleve);
   $("#ficheContenu").innerHTML = `
   <div class="card"><h1>${esc(e.nomComplet)} <span class="badge b-${e.statut}">${e.statut === "actif" ? "Actif" : "Archivé"}</span></h1>
     <p class="s">${esc(e.classe)} · ${esc(CYCLES[e.cycle] || "")}${e.etablissement ? " · " + esc(e.etablissement) : ""}</p>
@@ -289,6 +307,16 @@ function renderFiche() {
       <button class="btn btn-danger" data-action="annuler-periode" data-id="${c.periode.id}" type="button">Annuler…</button>`
       : `<button class="btn btn-light" data-action="reactiver-periode" data-id="${c.periode.id}" type="button">Réactiver</button>`}
       </div></div></div>`; }).join("") : '<p class="hint">Aucune période pour le moment.</p>'}</div>
+  <div class="card"><h2>Séances &amp; suivi pédagogique (${seancesEleve.length})</h2>
+    <p class="hint">Faites : ${statsS.faite} · Absences : ${statsS.absent} · Prévues : ${statsS.prevue} · Temps de cours réalisé : ${Math.floor(statsS.minutesFaites / 60)} h ${String(statsS.minutesFaites % 60).padStart(2, "0")}${e.frequenceSeances ? " · Fréquence convenue : " + esc(e.frequenceSeances) : ""}</p>
+    ${e.observationsPedagogiques ? `<p class="s">🎓 Observations pédagogiques : ${esc(e.observationsPedagogiques)}</p>` : ""}
+    <div class="actions-row"><button class="btn btn-primary" data-action="new-seance" data-id="${e.id}" type="button">+ Enregistrer / planifier une séance</button></div>
+    ${seancesEleve.length ? seancesEleve.map(ligneSeance).join("") : '<p class="hint">Aucune séance enregistrée. La fiche de présence, le suivi et les bilans se construiront uniquement à partir des séances réelles saisies ici.</p>'}</div>
+  <div class="card"><h2>Documents de l'élève (PDF / Word)</h2>
+    <p class="hint">Générés à la demande à partir des données enregistrées — aucune présence ni progression inventée. Pour corriger un document : modifiez les données, puis régénérez-le.</p>
+    <label class="field">Mois du bilan mensuel<input id="moisBilan" class="input" type="month" value="${L.todayISO().slice(0, 7)}"></label>
+    ${[["inscription", "Fiche d'inscription"], ["suivi", "Fiche individuelle de suivi pédagogique"], ["presence", "Fiche de présence"], ["bilan", "Bilan mensuel des progrès"], ["programme", "Programme personnalisé de révision"]].map(([t, n]) => `<div class="row"><div class="t">${n}</div><div class="actions-row"><button class="btn btn-light" data-action="doc-pdf" data-type="${t}" data-id="${e.id}" type="button">PDF</button><button class="btn btn-light" data-action="doc-word" data-type="${t}" data-id="${e.id}" type="button">Word</button><button class="btn btn-light" data-action="doc-imprime" data-type="${t}" data-id="${e.id}" type="button">Imprimer</button></div></div>`).join("")}
+  </div>
   <div class="card"><h2>Historique des paiements (${paiesEleve.length})</h2>
     ${paiesEleve.length ? paiesEleve.map(lignePaiement).join("") : '<p class="hint">Aucun paiement enregistré pour cet élève.</p>'}</div>
   <div class="card"><h2>Reçus (${recusEleve.length})</h2>
@@ -300,24 +328,28 @@ function formRepetition(eleveId) {
   openModal("Nouvelle répétition — " + e.nomComplet, `
   <form id="fRep" class="stack"><div id="fRepErr"></div>
     <label class="field">Matière / groupe de matières *<input name="matière" class="input" required placeholder="Mathématiques"></label>
-    <label class="field">Tarif convenu (${esc(settings.devise)} / mois, entier) *<input name="tarif" class="input" inputmode="numeric" required value="${e.tarifMensuel ?? ""}"></label>
+    <label class="field">Tarif convenu (${esc(settings.devise)} / période, entier) *<input name="tarif" class="input" inputmode="numeric" required value="${e.tarifMensuel ?? ""}"></label>
     <label class="field">Date de début *<input name="debut" class="input" type="date" required value="${L.todayISO()}"></label>
+    ${champsRegleHTML(null)}
     <label class="field">Notes<textarea name="notes" class="input" rows="2"></textarea></label>
-    <p class="hint">La première période sera créée avec une échéance à <strong>début + 1 mois calendaire</strong>. Aucune ancienne période ne sera modifiée.</p>
+    <p class="hint" id="repAperçu"></p>
     <button class="btn btn-primary" type="submit">Créer la répétition + 1ʳᵉ période</button></form>`);
+  const maj = () => { try { const f = new FormData($("#fRep")); $("#repAperçu").textContent = "Échéance de la 1ʳᵉ période : " + L.formatDateFR(L.calculerEcheance(f.get("debut"), lireRegle(f))); } catch (err) { $("#repAperçu").textContent = err.message; } };
+  $("#fRep").addEventListener("change", maj); maj();
   $("#fRep").onsubmit = async (ev) => {
     ev.preventDefault(); const f = new FormData(ev.target);
     const tarif = Number(f.get("tarif")), debut = f.get("debut"), mat = f.get("matière").trim();
-    const errs = [];
+    const regle = lireRegle(f); const errs = [];
     if (!mat) errs.push("La matière est obligatoire.");
     if (!Number.isInteger(tarif) || tarif < 0) errs.push("Tarif invalide (entier >= 0).");
-    if (!L.parseISODate(debut)) errs.push("Date de début invalide.");
+    let echeance = null;
+    try { echeance = L.calculerEcheance(debut, regle); } catch (err) { errs.push(err.message); }
     if (errs.length) { $("#fRepErr").innerHTML = erreursHtml(errs); return; }
-    const rep = { id: uid(), eleveId, matière: mat, dateDebut: debut, tarifConvenu: tarif, frequence: "mensuelle", statut: "active", notes: f.get("notes").trim(), createdAt: nowISO(), updatedAt: nowISO() };
+    const rep = { id: uid(), eleveId, matière: mat, dateDebut: debut, tarifConvenu: tarif, frequence: "mensuelle", regleEcheance: regle, statut: "active", notes: f.get("notes").trim(), createdAt: nowISO(), updatedAt: nowISO() };
     await putOne("repetitions", rep); await logSync("repetition", rep.id, "creation");
-    const per = { id: uid(), repetitionId: rep.id, dateDebut: debut, dateEcheance: L.addOneMonth(debut), montantDu: tarif, statutManuel: "active", createdAt: nowISO(), updatedAt: nowISO() };
+    const per = { id: uid(), repetitionId: rep.id, dateDebut: debut, dateEcheance: echeance, regleEcheance: regle, montantDu: tarif, statutManuel: "active", createdAt: nowISO(), updatedAt: nowISO() };
     await putOne("periodes", per); await logSync("periode", per.id, "creation");
-    toast("Répétition créée. Échéance : " + L.formatDateFR(per.dateEcheance) + ".");
+    toast("Répétition créée. Échéance : " + L.formatDateFR(echeance) + ".");
     closeModal(); await refresh();
   };
 }
@@ -327,28 +359,190 @@ function formNouvellePeriode(repetitionId, defautDebut, defautTarif) {
   const debut = defautDebut || L.todayISO();
   openModal("Nouvelle période — " + e.nomComplet, `
   <form id="fPer" class="stack"><div id="fPerErr"></div>
-    <p class="hint">Matière : <strong>${esc(rep.matière)}</strong>. Confirmez le tarif et la date de début : l'échéance = début + 1 mois calendaire. Les anciennes périodes restent inchangées.</p>
+    <p class="hint">Matière : <strong>${esc(rep.matière)}</strong>. Confirmez le tarif, la date de début et la règle d'échéance convenue avec le parent. Les anciennes périodes restent inchangées.</p>
     <label class="field">Date de début *<input name="debut" class="input" type="date" required value="${debut}"></label>
     <label class="field">Montant dû (${esc(settings.devise)}, entier) *<input name="montant" class="input" inputmode="numeric" required value="${defautTarif ?? rep.tarifConvenu}"></label>
+    ${champsRegleHTML(rep.regleEcheance)}
     <p class="hint" id="perAperçu"></p>
     <button class="btn btn-primary" type="submit">Confirmer et créer la période</button></form>`);
-  const maj = () => { const d = $("#fPer [name=debut]").value; $("#perAperçu").textContent = L.parseISODate(d) ? "Échéance calculée : " + L.formatDateFR(L.addOneMonth(d)) : ""; };
-  $("#fPer [name=debut]").addEventListener("change", maj); maj();
+  const maj = () => { try { const f = new FormData($("#fPer")); $("#perAperçu").textContent = "Échéance calculée : " + L.formatDateFR(L.calculerEcheance(f.get("debut"), lireRegle(f))); } catch (err) { $("#perAperçu").textContent = err.message; } };
+  $("#fPer").addEventListener("change", maj); maj();
   $("#fPer").onsubmit = async (ev) => {
     ev.preventDefault(); const f = new FormData(ev.target);
-    const d = f.get("debut"), m = Number(f.get("montant"));
+    const d = f.get("debut"), m = Number(f.get("montant")), regle = lireRegle(f);
     const errs = [];
-    if (!L.parseISODate(d)) errs.push("Date de début invalide.");
     if (!Number.isInteger(m) || m < 0) errs.push("Montant dû invalide (entier >= 0).");
+    let echeance = null;
+    try { echeance = L.calculerEcheance(d, regle); } catch (err) { errs.push(err.message); }
     if (errs.length) { $("#fPerErr").innerHTML = erreursHtml(errs); return; }
-    const per = { id: uid(), repetitionId, dateDebut: d, dateEcheance: L.addOneMonth(d), montantDu: m, statutManuel: "active", createdAt: nowISO(), updatedAt: nowISO() };
+    const per = { id: uid(), repetitionId, dateDebut: d, dateEcheance: echeance, regleEcheance: regle, montantDu: m, statutManuel: "active", createdAt: nowISO(), updatedAt: nowISO() };
     await putOne("periodes", per); await logSync("periode", per.id, "creation");
-    toast("Période créée. Échéance : " + L.formatDateFR(per.dateEcheance) + ".");
+    toast("Période créée. Échéance : " + L.formatDateFR(echeance) + ".");
     closeModal(); await refresh();
   };
 }
 
+/* ---------------- Séances & suivi pédagogique ---------------- */
+/* ---------------- Séances & suivi pédagogique ---------------- */
+function ligneSeance(s) {
+  const eleve = S.eleves.find((e) => e.id === s.eleveId);
+  const details = [s.chapitre ? "Chapitre : " + s.chapitre : "", s.exercices ? "Exercices : " + s.exercices : "",
+    s.difficultes ? "Difficultés : " + s.difficultes : "", s.progrès ? "Progrès : " + s.progrès : "",
+    s.devoirs ? "Devoirs : " + s.devoirs : "", s.objectifsSuivants ? "Objectifs séance suivante : " + s.objectifsSuivants : ""].filter(Boolean);
+  return `<div class="row"><div><div class="t">${L.formatDateFR(s.date)}${s.heure ? " · " + esc(s.heure) : ""} — ${esc(s.matière)} (${s.dureeMinutes} min)</div>
+    <div class="s">${eleve ? esc(eleve.nomComplet) + " · " + esc(eleve.classe) : ""}</div>
+    ${details.map((d) => `<div class="s">${esc(d)}</div>`).join("")}</div>
+    <div><span class="badge b-${s.statut}">${esc(STATUTS_SEANCE[s.statut] || s.statut)}</span>
+    <div class="actions-row">
+    ${s.statut === "prevue" ? `<button class="btn btn-teal" data-action="seance-statut" data-statut="faite" data-id="${s.id}" type="button">Faite</button>
+    <button class="btn btn-light" data-action="seance-statut" data-statut="absent" data-id="${s.id}" type="button">Absent</button>` : ""}
+    <button class="btn btn-light" data-action="edit-seance" data-id="${s.id}" type="button">Modifier</button>
+    <button class="btn btn-danger" data-action="delete-seance" data-id="${s.id}" type="button">Supprimer…</button></div></div></div>`;
+}
+function formSeance(eleveId, seanceExistante) {
+  const e = S.eleves.find((x) => x.id === eleveId);
+  const s = seanceExistante || { date: L.todayISO(), heure: "", dureeMinutes: 60, matière: "", chapitre: "", exercices: "", difficultes: "", progrès: "", devoirs: "", objectifsSuivants: "", statut: "faite" };
+  const mats = [...new Set([...S.repetitions.filter((r) => r.eleveId === eleveId).map((r) => r.matière),
+    ...(e.matieres || "").split(",").map((m) => m.trim()).filter(Boolean)])];
+  const derniere = S.seances.filter((x) => x.eleveId === eleveId && x.id !== s.id && x.objectifsSuivants)
+    .sort((a, b) => b.date.localeCompare(a.date))[0];
+  openModal((seanceExistante ? "Modifier la séance" : "Séance") + " — " + e.nomComplet, `
+  <form id="fSeance" class="stack"><div id="fSeanceErr"></div>
+    ${derniere ? `<p class="hint">🎯 Objectifs préparés à la séance du ${L.formatDateFR(derniere.date)} : <strong>${esc(derniere.objectifsSuivants)}</strong></p>` : ""}
+    <label class="field">Date *<input name="date" class="input" type="date" required value="${esc(s.date)}"></label>
+    <label class="field">Heure (facultatif)<input name="heure" class="input" type="time" value="${esc(s.heure || "")}"></label>
+    <label class="field">Durée (minutes) *<input name="duree" class="input" inputmode="numeric" required value="${s.dureeMinutes}"></label>
+    <label class="field">Matière *<input name="matière" class="input" list="matsSeance" required value="${esc(s.matière)}"><datalist id="matsSeance">${mats.map((m) => `<option value="${esc(m)}">`).join("")}</datalist></label>
+    <label class="field">Statut *<select name="statut" class="input">${Object.entries(STATUTS_SEANCE).map(([k, v]) => `<option value="${k}" ${s.statut === k ? "selected" : ""}>${v}</option>`).join("")}</select></label>
+    <label class="field">Chapitre étudié<input name="chapitre" class="input" value="${esc(s.chapitre || "")}"></label>
+    <label class="field">Exercices réalisés<textarea name="exercices" class="input" rows="2">${esc(s.exercices || "")}</textarea></label>
+    <label class="field">Difficultés observées<textarea name="difficultes" class="input" rows="2">${esc(s.difficultes || "")}</textarea></label>
+    <label class="field">Progrès observés<textarea name="progrès" class="input" rows="2">${esc(s.progrès || "")}</textarea></label>
+    <label class="field">Devoirs à faire<textarea name="devoirs" class="input" rows="2">${esc(s.devoirs || "")}</textarea></label>
+    <label class="field">Objectifs de la séance suivante<textarea name="objectifs" class="input" rows="2">${esc(s.objectifsSuivants || "")}</textarea></label>
+    <button class="btn btn-primary" type="submit">${seanceExistante ? "Enregistrer" : "Ajouter la séance"}</button></form>`);
+  $("#fSeance").onsubmit = async (ev) => {
+    ev.preventDefault(); const f = new FormData(ev.target);
+    const data = { eleveId, date: f.get("date"), heure: f.get("heure") || "", dureeMinutes: Number(f.get("duree")),
+      matière: f.get("matière").trim(), statut: f.get("statut"), chapitre: f.get("chapitre").trim(),
+      exercices: f.get("exercices").trim(), difficultes: f.get("difficultes").trim(), progrès: f.get("progrès").trim(),
+      devoirs: f.get("devoirs").trim(), objectifsSuivants: f.get("objectifs").trim() };
+    const errs = L.validerSeance(data);
+    if (errs.length) { $("#fSeanceErr").innerHTML = erreursHtml(errs); return; }
+    if (seanceExistante) { Object.assign(seanceExistante, data, { updatedAt: nowISO() }); await putOne("seances", seanceExistante); await logSync("seance", seanceExistante.id, "modification"); }
+    else { const obj = { id: uid(), repetitionId: "", ...data, createdAt: nowISO(), updatedAt: nowISO() }; await putOne("seances", obj); await logSync("seance", obj.id, "creation"); }
+    toast("Séance enregistrée."); closeModal(); await refresh();
+  };
+}
+
+/* ---------------- Documents pédagogiques (données réelles uniquement) ---------------- */
+function lignesDocument(type, e, mois) {
+  const reps = S.repetitions.filter((r) => r.eleveId === e.id);
+  const seances = S.seances.filter((s) => s.eleveId === e.id).sort((a, b) => a.date.localeCompare(b.date));
+  const paiesValides = S.paiements.filter((p) => { const per = S.periodes.find((x) => x.id === p.periodeId); return per && contextePeriode(per).eleve?.id === e.id && p.statut === "valide"; });
+  const T = (text, size, bold) => ({ text, size: size || 11, bold: !!bold });
+  const head = [T(settings.activite || "RépétiPro", 14, true)];
+  if (settings.slogan) head.push(T(settings.slogan, 10));
+  const contact = [settings.telephone ? "Tél. : " + settings.telephone : "", settings.coordonnees || ""].filter(Boolean).join(" · ");
+  if (contact) head.push(T(contact, 10));
+  head.push({ rule: true });
+  const pied = [{ rule: true }, T("Document généré par RépétiPro le " + L.formatDateFR(L.todayISO()) + ", uniquement à partir des données enregistrées.", 9)];
+  const identite = [T("Élève : " + e.nomComplet, 12, true),
+    T("Classe : " + e.classe + " (" + (CYCLES[e.cycle] || "") + ")" + (e.etablissement ? " — Établissement : " + e.etablissement : ""))];
+  let titre = "", corps = [];
+  if (type === "inscription") {
+    titre = "Fiche d'inscription";
+    corps = [...identite,
+      T("Nom : " + (e.nom || "—") + " · Prénom : " + (e.prénom || "—")),
+      T("Parent / tuteur : " + (e.parent || "—") + (e.telephoneParent ? " · Tél. : " + e.telephoneParent : "")),
+      T("Téléphone de contact : " + (e.telephone || "—")),
+      T("Matières suivies : " + ([...new Set([...(e.matieres || "").split(",").map((m) => m.trim()), ...reps.map((r) => r.matière)])].filter(Boolean).join(", ") || "—")),
+      T("Date de début des répétitions : " + L.formatDateFR(e.dateDebut)),
+      T("Tarif convenu : " + (e.tarifMensuel != null ? fmt(e.tarifMensuel) + " / mois" : reps.map((r) => r.matière + " : " + fmt(r.tarifConvenu)).join(" ; ") || "—")),
+      T("Fréquence des séances : " + (e.frequenceSeances || "—")),
+      T("Statut : " + (e.statut === "actif" ? "Actif" : "Archivé")),
+      ...(e.observationsPedagogiques ? [T("Observations pédagogiques : " + e.observationsPedagogiques)] : []),
+      { rule: true }, T("Répétitions en cours :"), ...reps.map((r) => T("• " + r.matière + " — depuis le " + L.formatDateFR(r.dateDebut) + " — " + fmt(r.tarifConvenu) + " / mois")),
+      { rule: true }, T("Fait le " + L.formatDateFR(L.todayISO()) + "."), T("Signature du parent / tuteur : ______________________"), T("Signature du répétiteur : ______________________")];
+  } else if (type === "suivi") {
+    titre = "Fiche individuelle de suivi pédagogique";
+    corps = [...identite, ...(e.observationsPedagogiques ? [T("Observations pédagogiques : " + e.observationsPedagogiques)] : []), { rule: true }];
+    if (!seances.length) corps.push(T("Aucune séance enregistrée à ce jour."));
+    for (const s of seances) {
+      corps.push(T(L.formatDateFR(s.date) + " — " + s.matière + " (" + s.dureeMinutes + " min) — " + (STATUTS_SEANCE[s.statut] || s.statut), 11, true));
+      if (s.chapitre) corps.push(T("   Chapitre : " + s.chapitre));
+      if (s.exercices) corps.push(T("   Exercices : " + s.exercices));
+      if (s.difficultes) corps.push(T("   Difficultés : " + s.difficultes));
+      if (s.progrès) corps.push(T("   Progrès : " + s.progrès));
+      if (s.devoirs) corps.push(T("   Devoirs donnés : " + s.devoirs));
+      if (s.objectifsSuivants) corps.push(T("   Objectifs séance suivante : " + s.objectifsSuivants));
+    }
+  } else if (type === "presence") {
+    titre = "Fiche de présence";
+    const st = L.statsSeances(seances);
+    corps = [...identite, T("Séances faites (présent) : " + st.faite + " · Absences : " + st.absent + " · Annulées : " + st.annulee + " · Prévues : " + st.prevue),
+      T("Temps de cours réalisé : " + Math.floor(st.minutesFaites / 60) + " h " + String(st.minutesFaites % 60).padStart(2, "0")), { rule: true }];
+    if (!seances.length) corps.push(T("Aucune séance enregistrée à ce jour."));
+    for (const s of seances) corps.push(T(L.formatDateFR(s.date) + (s.heure ? " " + s.heure : "") + " — " + s.matière + " — " + (STATUTS_SEANCE[s.statut] || s.statut) + " — " + s.dureeMinutes + " min"));
+  } else if (type === "bilan") {
+    const b = L.bilanMensuel(seances, paiesValides, mois);
+    titre = "Bilan mensuel des progrès — " + mois;
+    corps = [...identite,
+      T("Séances faites : " + b.nbFaites + " · Absences : " + b.nbAbsences + " · Annulées : " + b.nbAnnulees + " · Prévues : " + b.nbPrevues),
+      T("Temps de cours : " + Math.floor(b.minutes / 60) + " h " + String(b.minutes % 60).padStart(2, "0")),
+      T("Chapitres étudiés : " + (b.chapitres.join(" ; ") || "aucun chapitre renseigné ce mois-ci")),
+      { rule: true }, T("Progrès constatés (séances enregistrées) :", 11, true),
+      ...(b.progrès.length ? b.progrès.map((p) => T("• " + L.formatDateFR(p.date) + " : " + p.texte)) : [T("Aucun progrès noté ce mois-ci.")]),
+      T("Difficultés à travailler :", 11, true),
+      ...(b.difficultes.length ? b.difficultes.map((d) => T("• " + L.formatDateFR(d.date) + " (" + d.matière + ") : " + d.texte)) : [T("Aucune difficulté notée ce mois-ci.")]),
+      { rule: true }, T("Encaissé ce mois-ci : " + fmt(b.encaisse)), T("Solde restant dû au " + L.formatDateFR(L.todayISO()) + " : " + fmt(soldeEleve(e.id)))];
+  } else if (type === "programme") {
+    titre = "Programme personnalisé de révision";
+    const avecDiff = seances.filter((s) => s.difficultes && s.difficultes.trim());
+    const objectifs = seances.filter((s) => s.objectifsSuivants && s.objectifsSuivants.trim()).slice(-5);
+    const derniere = [...seances].filter((s) => s.statut === "faite").pop();
+    corps = [...identite,
+      T("Construit à partir des difficultés et objectifs réellement notés en séance.", 10), { rule: true },
+      T("1) À réviser en priorité (difficultés observées) :", 12, true),
+      ...(avecDiff.length ? avecDiff.map((s) => T("[ ] " + s.matière + (s.chapitre ? " — " + s.chapitre : "") + " : " + s.difficultes.trim() + " (noté le " + L.formatDateFR(s.date) + ")")) : [T("Aucune difficulté enregistrée : notez-les pendant les séances pour alimenter ce programme.")]),
+      T("2) Objectifs prioritaires (préparés en séance) :", 12, true),
+      ...(objectifs.length ? objectifs.map((s) => T("[ ] " + s.objectifsSuivants.trim() + " (prévu le " + L.formatDateFR(s.date) + ")")) : [T("Aucun objectif enregistré pour le moment.")]),
+      T("3) Devoirs en cours (dernière séance faite) :", 12, true),
+      T(derniere && derniere.devoirs ? "[ ] " + derniere.devoirs : "Aucun devoir noté à la dernière séance faite.")];
+  }
+  return { titre, lines: [...head, T(titre, 15, true), ...corps, ...pied] };
+}
+function slugNom(txt) { return String(txt || "eleve").normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-|-$/g, "").toLowerCase() || "eleve"; }
+function exporterDocument(eleveId, type, format) {
+  const e = S.eleves.find((x) => x.id === eleveId); if (!e) return;
+  const mois = ($("#moisBilan") && $("#moisBilan").value) || L.todayISO().slice(0, 7);
+  const { titre, lines } = lignesDocument(type, e, mois);
+  const base = type + "-" + slugNom(e.nomComplet) + (type === "bilan" ? "-" + mois : "");
+  if (format === "pdf") download(new Blob([L.genererPDF(titre, lines, "A4")], { type: "application/pdf" }), base + ".pdf");
+  else if (format === "word") download(new Blob([L.genererDOCX(titre, lines)], { type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }), base + ".docx");
+  else { $("#printArea").innerHTML = `<div class="recu-aperçu"><div class="head">${esc(titre)}</div>` + lines.map((l) => l.rule ? "<hr>" : `<div style="font-size:${Math.min((l.size || 11) + 3, 20)}px;${l.bold ? "font-weight:700" : ""}">${esc(l.text || "")}</div>`).join("") + "</div>"; window.print(); }
+  if (format !== "imprime") toast(titre + " généré à partir des données de " + e.nomComplet + ".");
+}
+
+/* ---------------- Règle d'échéance configurable (formulaires) ---------------- */
+function champsRegleHTML(regle) {
+  const r = regle || { type: "mois_calendaire" };
+  return `<label class="field">Règle d'échéance<select name="regleType" class="input">
+    <option value="mois_calendaire" ${r.type === "mois_calendaire" ? "selected" : ""}>1 mois calendaire après le début (défaut)</option>
+    <option value="jour_fixe" ${r.type === "jour_fixe" ? "selected" : ""}>Jour fixe de chaque mois (ex : le 5)</option>
+    <option value="duree_jours" ${r.type === "duree_jours" ? "selected" : ""}>Durée en jours (ex : 30 jours)</option>
+    <option value="manuelle" ${r.type === "manuelle" ? "selected" : ""}>Date d'échéance choisie manuellement</option></select></label>
+  <label class="field">Si « jour fixe » : jour du mois (1 à 31)<input name="jourFixe" class="input" inputmode="numeric" value="${r.jourFixe || ""}" placeholder="Ex : 5"></label>
+  <label class="field">Si « durée » : nombre de jours<input name="dureeJours" class="input" inputmode="numeric" value="${r.dureeJours || ""}" placeholder="Ex : 30"></label>
+  <label class="field">Si « manuelle » : date d'échéance<input name="dateManuelle" class="input" type="date" value="${r.dateManuelle || ""}"></label>`;
+}
+function lireRegle(form) {
+  const type = form.get("regleType") || "mois_calendaire";
+  return { type, jourFixe: Number(form.get("jourFixe")) || undefined, dureeJours: Number(form.get("dureeJours")) || undefined, dateManuelle: form.get("dateManuelle") || undefined };
+}
+
 /* ---------------- F. Paiements ---------------- */
+
 function periodesPayables() {
   return toutesPeriodesCalc().filter((c) => c.solde > 0 && c.statut !== "annulee" && c.statut !== "suspendue")
     .sort((a, b) => a.periode.dateEcheance.localeCompare(b.periode.dateEcheance));
@@ -691,7 +885,7 @@ function renderSynchro() {
 }
 async function exporterSauvegarde() {
   await reload();
-  const data = { eleves: S.eleves, repetitions: S.repetitions, periodes: S.periodes, paiements: S.paiements, recus: S.recus, settings };
+  const data = { eleves: S.eleves, repetitions: S.repetitions, periodes: S.periodes, paiements: S.paiements, recus: S.recus, seances: S.seances, settings };
   const sauvegarde = { app: "RépétiPro", version: 1, exporteLe: nowISO(), data, checksum: L.checksum(JSON.stringify(data)) };
   download(new Blob([JSON.stringify(sauvegarde, null, 2)], { type: "application/json" }), "repetipro-sauvegarde-" + L.todayISO() + ".json");
   toast("Sauvegarde exportée. Conservez-la en lieu sûr (ex. Google Drive).");
@@ -709,6 +903,7 @@ async function importerSauvegarde(fichier) {
   await tx(STORES, "readwrite", (...stores) => {
     const parNom = Object.fromEntries(STORES.map((n, i) => [n, stores[i]]));
     for (const k of ["eleves", "repetitions", "periodes", "paiements", "recus"]) { parNom[k].clear(); for (const item of obj.data[k]) parNom[k].put(item); }
+    parNom.seances.clear(); for (const item of obj.data.seances || []) parNom.seances.put(item);
     if (obj.data.settings) parNom.meta.put(obj.data.settings);
     const maxSeq = obj.data.recus.reduce((m, r) => Math.max(m, parseInt((r.numero.split("-")[2] || "0"), 10) || 0), 0);
     parNom.meta.put({ id: "compteurRecu", valeur: maxSeq });
@@ -754,9 +949,9 @@ async function verifierRappels() {
 
 /* ---------------- Actions globales ---------------- */
 function bindRowActions(root) {
-  $$("[data-action]", root).forEach((b) => { if (!b._bound) { b._bound = true; b.addEventListener("click", () => handleAction(b.dataset.action, b.dataset.id)); } });
+  $$("[data-action]", root).forEach((b) => { if (!b._bound) { b._bound = true; b.addEventListener("click", () => handleAction(b.dataset.action, b.dataset.id, b.dataset.type, b.dataset.statut)); } });
 }
-async function handleAction(action, id) {
+async function handleAction(action, id, type, statut) {
   if (action === "new-eleve") formEleve(null);
   else if (action === "fiche") { currentEleveId = id; showView("fiche"); }
   else if (action === "back-eleves") showView("eleves");
@@ -786,7 +981,20 @@ async function handleAction(action, id) {
       per.statutManuel = "annulee"; per.updatedAt = nowISO(); await putOne("periodes", per);
       await logSync("periode", per.id, "annulation"); toast("Période annulée (conservée dans l'historique)."); await refresh();
     }
-  } else if (action === "toggle-archive") {
+  } else if (action === "new-seance") formSeance(id, null);
+  else if (action === "edit-seance") { const s = S.seances.find((x) => x.id === id); if (s) formSeance(s.eleveId, s); }
+  else if (action === "seance-statut") {
+    const s = S.seances.find((x) => x.id === id);
+    if (s && STATUTS_SEANCE[statut]) { s.statut = statut; s.updatedAt = nowISO(); await putOne("seances", s); await logSync("seance", s.id, "statut_" + statut); toast("Séance marquée : " + STATUTS_SEANCE[statut] + "."); await refresh(); }
+  } else if (action === "delete-seance") {
+    const s = S.seances.find((x) => x.id === id);
+    if (s && await confirmBox("Supprimer cette séance ?", "Séance du " + L.formatDateFR(s.date) + " (" + esc(s.matière) + "). Elle disparaîtra aussi des fiches de présence et des bilans régénérés.", "Supprimer")) {
+      await tx(["seances"], "readwrite", (st) => st.delete(id)); await logSync("seance", id, "suppression"); toast("Séance supprimée."); await refresh();
+    }
+  } else if (action === "doc-pdf") exporterDocument(id, type, "pdf");
+  else if (action === "doc-word") exporterDocument(id, type, "word");
+  else if (action === "doc-imprime") exporterDocument(id, type, "imprime");
+  else if (action === "toggle-archive") {
     const e = S.eleves.find((x) => x.id === id);
     e.statut = e.statut === "actif" ? "archive" : "actif"; e.updatedAt = nowISO();
     await putOne("eleves", e); await logSync("eleve", e.id, e.statut === "archive" ? "archivage" : "reactivation");
@@ -798,7 +1006,8 @@ async function handleAction(action, id) {
     if (await confirmBox("Suppression définitive", `Supprimer définitivement <strong>${esc(e.nomComplet)}</strong> et ses répétitions/périodes (sans aucun paiement) ? Cette action est irréversible.`, "Supprimer")) {
       const reps = S.repetitions.filter((r) => r.eleveId === id);
       const pers = S.periodes.filter((p) => reps.some((r) => r.id === p.repetitionId));
-      await tx(["eleves", "repetitions", "periodes"], "readwrite", (se, sr, sp) => { se.delete(id); reps.forEach((r) => sr.delete(r.id)); pers.forEach((p) => sp.delete(p.id)); });
+      const seancesE = S.seances.filter((s) => s.eleveId === id);
+      await tx(["eleves", "repetitions", "periodes", "seances"], "readwrite", (se, sr, sp, ss) => { se.delete(id); reps.forEach((r) => sr.delete(r.id)); pers.forEach((p) => sp.delete(p.id)); seancesE.forEach((s) => ss.delete(s.id)); });
       await logSync("eleve", id, "suppression"); toast("Élève supprimé."); showView("eleves"); await refresh();
     }
   }
@@ -821,6 +1030,8 @@ async function chargerDemo() {
     const per = { id: uid(), repetitionId: rep.id, dateDebut: x.debut, dateEcheance: L.addOneMonth(x.debut), montantDu: x.tarif, statutManuel: "active", createdAt: nowISO(), updatedAt: nowISO() };
     await putOne("periodes", per);
     if (x.paiement > 0) { await reload(); await enregistrerPaiement({ periodeId: per.id, montant: x.paiement, datePaiement: x.debut + "T10:00", moyenPaiement: "mobile_money", reference: "DÉMO", note: "Démonstration" }, calcPeriode(per)); }
+    await putOne("seances", { id: uid(), eleveId: e.id, repetitionId: rep.id, date: x.debut, heure: "15:00", dureeMinutes: 90, matière: x.mat, chapitre: "Chapitre de démonstration", exercices: "Exercices d'application (démo)", difficultes: "Difficulté notée en démonstration", progrès: "Progrès observé (démo)", devoirs: "Devoirs de démonstration", objectifsSuivants: "Objectif de la prochaine séance (démo)", statut: "faite", createdAt: nowISO(), updatedAt: nowISO() });
+    await putOne("seances", { id: uid(), eleveId: e.id, repetitionId: rep.id, date: L.addDays(jour, 2), heure: "15:00", dureeMinutes: 90, matière: x.mat, chapitre: "À préparer (démo)", exercices: "", difficultes: "", progrès: "", devoirs: "", objectifsSuivants: "", statut: "prevue", createdAt: nowISO(), updatedAt: nowISO() });
   }
   await logSync("demo", "demo", "chargement");
   toast("Données de démonstration chargées (fictives)."); await refresh(); showView("dashboard");

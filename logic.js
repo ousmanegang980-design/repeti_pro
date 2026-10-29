@@ -70,13 +70,13 @@
     if (solde <= 0 && per.montantDu >= 0 && montantPaye >= per.montantDu && per.montantDu > 0) return "payee";
     if (per.montantDu === 0) return "payee";
     if (montantPaye > 0) return diffDays(per.dateEcheance, jour) > 0 ? "partiel_en_retard" : "partiel";
-    const delta = diffDays(jour, per.dateEcheance); // >0 : à venir
-    if (delta > 0) return "a_venir";
+    const delta = diffDays(jour, per.dateEcheance); // >0 : échéance future
+    if (delta > 0) return (per.dateDebut && jour >= per.dateDebut) ? "en_cours" : "a_venir";
     if (delta === 0) return "aujourd_hui";
     return "en_retard";
   }
   const LIBELLES_STATUT = {
-    a_venir: "À venir", aujourd_hui: "À payer aujourd'hui", en_retard: "En retard",
+    a_venir: "À venir", en_cours: "En cours", aujourd_hui: "À payer aujourd'hui", en_retard: "En retard",
     partiel: "Paiement partiel", partiel_en_retard: "Partiel — en retard",
     payee: "Payée", suspendue: "Suspendue", annulee: "Annulée",
   };
@@ -94,6 +94,7 @@
     if (!e.classe || !e.classe.trim()) erreurs.push("La classe est obligatoire.");
     if (!["primaire", "college", "lycee"].includes(e.cycle)) erreurs.push("Cycle invalide (primaire, collège ou lycée).");
     if (e.telephone && !/^[+0-9][0-9 .-]{5,19}$/.test(e.telephone.trim())) erreurs.push("Téléphone invalide.");
+    if (e.telephoneParent && !/^[+0-9][0-9 .-]{5,19}$/.test(e.telephoneParent.trim())) erreurs.push("Téléphone du parent/tuteur invalide.");
     if (e.tarifMensuel != null && e.tarifMensuel !== "" && (!Number.isInteger(e.tarifMensuel) || e.tarifMensuel < 0))
       erreurs.push("Le tarif mensuel doit être un entier >= 0.");
     if (e.dateDebut && !parseISODate(e.dateDebut)) erreurs.push("Date de début invalide (AAAA-MM-JJ).");
@@ -227,6 +228,11 @@
     if (obj.checksum !== attendu) erreurs.push("Somme de contrôle invalide : fichier corrompu ou modifié (attendu " + attendu + ").");
     const idsPeriodes = new Set(obj.data.periodes.map((p) => p.id));
     for (const p of obj.data.paiements) if (!idsPeriodes.has(p.periodeId)) erreurs.push("Paiement orphelin (période introuvable) : " + p.id);
+    if (obj.data.seances != null) {
+      if (!Array.isArray(obj.data.seances)) erreurs.push("Section invalide : seances.");
+      else { const idsEleves = new Set(obj.data.eleves.map((e) => e.id));
+        for (const s of obj.data.seances) if (!idsEleves.has(s.eleveId)) erreurs.push("Séance orpheline (élève introuvable) : " + s.id); }
+    }
     const nums = obj.data.recus.map((r) => r.numero);
     if (new Set(nums).size !== nums.length) erreurs.push("Numéros de reçu en double détectés.");
     return erreurs;
@@ -253,7 +259,121 @@
     return lignes.join("\r\n") + "\r\n";
   }
 
+  /* ---------- Règle d'échéance configurable ---------- */
+  function calculerEcheance(dateDebut, regle) {
+    const r = regle || { type: "mois_calendaire" };
+    if (!parseISODate(dateDebut)) throw new Error("Date de début invalide : " + dateDebut);
+    if (r.type === "mois_calendaire") return addOneMonth(dateDebut);
+    if (r.type === "jour_fixe") {
+      const jf = r.jourFixe;
+      if (!Number.isInteger(jf) || jf < 1 || jf > 31) throw new Error("Jour fixe invalide (1 à 31).");
+      const p = parseISODate(dateDebut);
+      let y = p.y, m = p.m;
+      let cand = toISODate(y, m, Math.min(jf, daysInMonth(y, m)));
+      if (cand <= dateDebut) { m += 1; if (m > 12) { m = 1; y += 1; } cand = toISODate(y, m, Math.min(jf, daysInMonth(y, m))); }
+      return cand;
+    }
+    if (r.type === "duree_jours") {
+      if (!Number.isInteger(r.dureeJours) || r.dureeJours < 1) throw new Error("Durée en jours invalide (>= 1).");
+      return addDays(dateDebut, r.dureeJours);
+    }
+    if (r.type === "manuelle") {
+      if (!parseISODate(r.dateManuelle)) throw new Error("Date d'échéance manuelle invalide.");
+      return r.dateManuelle;
+    }
+    throw new Error("Règle d'échéance inconnue : " + r.type);
+  }
+
+  /* ---------- Séances & suivi pédagogique ---------- */
+  const STATUTS_SEANCE = ["prevue", "faite", "absent", "annulee"];
+  function validerSeance(s) {
+    const erreurs = [];
+    if (!s.eleveId) erreurs.push("Séance sans élève.");
+    if (!parseISODate(s.date)) erreurs.push("Date de séance invalide (AAAA-MM-JJ).");
+    if (!Number.isInteger(s.dureeMinutes) || s.dureeMinutes < 1 || s.dureeMinutes > 720) erreurs.push("Durée invalide (minutes entières, 1 à 720).");
+    if (!s.matière || !String(s.matière).trim()) erreurs.push("La matière est obligatoire.");
+    if (!STATUTS_SEANCE.includes(s.statut)) erreurs.push("Statut de séance invalide (prévue, faite, absent, annulée).");
+    return erreurs;
+  }
+  function statsSeances(seances) {
+    const st = { prevue: 0, faite: 0, absent: 0, annulee: 0, minutesFaites: 0 };
+    for (const s of seances || []) {
+      if (st[s.statut] != null) st[s.statut] += 1;
+      if (s.statut === "faite" && Number.isInteger(s.dureeMinutes)) st.minutesFaites += s.dureeMinutes;
+    }
+    return st;
+  }
+  /* Bilan d'un mois construit UNIQUEMENT à partir d'entrées réellement enregistrées. */
+  function bilanMensuel(seancesEleve, paiementsEleveValides, mois) {
+    const duMois = (seancesEleve || []).filter((s) => s.date && s.date.startsWith(mois));
+    const faites = duMois.filter((s) => s.statut === "faite");
+    const uniq = (arr) => [...new Set(arr.filter(Boolean))];
+    return {
+      mois,
+      nbFaites: faites.length,
+      nbAbsences: duMois.filter((s) => s.statut === "absent").length,
+      nbAnnulees: duMois.filter((s) => s.statut === "annulee").length,
+      nbPrevues: duMois.filter((s) => s.statut === "prevue").length,
+      minutes: faites.reduce((a, s) => a + (Number.isInteger(s.dureeMinutes) ? s.dureeMinutes : 0), 0),
+      chapitres: uniq(faites.map((s) => (s.chapitre || "").trim())),
+      progrès: faites.filter((s) => s.progrès && s.progrès.trim()).map((s) => ({ date: s.date, texte: s.progrès.trim() })),
+      difficultes: faites.filter((s) => s.difficultes && s.difficultes.trim()).map((s) => ({ date: s.date, matière: s.matière, texte: s.difficultes.trim() })),
+      encaisse: (paiementsEleveValides || []).filter((p) => p.datePaiement.startsWith(mois)).reduce((a, p) => a + p.montant, 0),
+    };
+  }
+
+  /* ---------- Document Word (.docx) généré nativement (ZIP stocké + XML OOXML) ---------- */
+  function xmlEscape(t) { return String(t == null ? "" : t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }
+  const CRC_TABLE = (() => { const t = []; for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1); t[n] = c >>> 0; } return t; })();
+  function crc32(bytes) { let c = 0xFFFFFFFF; for (const b of bytes) c = CRC_TABLE[(c ^ b) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+  function zipStore(fichiers) {
+    const enc = new TextEncoder();
+    const u16 = (v) => [v & 255, (v >> 8) & 255];
+    const u32 = (v) => [v & 255, (v >> 8) & 255, (v >> 16) & 255, (v >>> 24) & 255];
+    const morceaux = [], central = [];
+    let offset = 0;
+    for (const f of fichiers) {
+      const nomB = enc.encode(f.nom), crc = crc32(f.bytes);
+      const local = [...u32(0x04034b50), ...u16(20), ...u16(0x0800), ...u16(0), ...u16(0), ...u16(0), ...u32(crc), ...u32(f.bytes.length), ...u32(f.bytes.length), ...u16(nomB.length), ...u16(0)];
+      morceaux.push(local, nomB, f.bytes);
+      central.push([...u32(0x02014b50), ...u16(20), ...u16(20), ...u16(0x0800), ...u16(0), ...u16(0), ...u16(0), ...u32(crc), ...u32(f.bytes.length), ...u32(f.bytes.length), ...u16(nomB.length), ...u16(0), ...u16(0), ...u16(0), ...u16(0), ...u32(0), ...u32(offset)], nomB);
+      offset += local.length + nomB.length + f.bytes.length;
+    }
+    let centralTaille = 0; for (const c of central) centralTaille += c.length;
+    const fin = [...u32(0x06054b50), ...u16(0), ...u16(0), ...u16(fichiers.length), ...u16(fichiers.length), ...u32(centralTaille), ...u32(offset), ...u16(0)];
+    const tout = [...morceaux, ...central, fin];
+    let total = 0; for (const m of tout) total += m.length;
+    const out = new Uint8Array(total); let pos = 0;
+    for (const m of tout) { out.set(m, pos); pos += m.length; }
+    return out;
+  }
+  function genererDOCX(titre, lines) {
+    const enc = new TextEncoder();
+    const para = (texte, opt) => {
+      const o = opt || {}, sz = (o.size || 11) * 2;
+      const rPr = "<w:rPr>" + (o.bold ? "<w:b/>" : "") + '<w:sz w:val="' + sz + '"/><w:szCs w:val="' + sz + '"/>' + (o.color ? '<w:color w:val="' + o.color + '"/>' : "") + "</w:rPr>";
+      const pPr = o.rule ? '<w:pPr><w:pBdr><w:bottom w:val="single" w:sz="6" w:space="1" w:color="B9C9D4"/></w:pBdr></w:pPr>'
+        : (o.box ? '<w:pPr><w:shd w:val="clear" w:fill="E6F7F4"/></w:pPr>' : "");
+      return "<w:p>" + pPr + "<w:r>" + rPr + '<w:t xml:space="preserve">' + xmlEscape(texte || "") + "</w:t></w:r></w:p>";
+    };
+    let corps = para(titre, { size: 18, bold: true, color: "0F2A43" });
+    for (const ln of lines || []) corps += ln.rule ? para("", { rule: true }) : para(ln.text, ln);
+    const documentXml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>' + corps + '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1134" w:bottom="1134" w:left="1134" w:right="1134"/></w:sectPr></w:body></w:document>';
+    const contentTypes = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/></Types>';
+    const rels = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>';
+    const docRels = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>';
+    const styles = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/><w:sz w:val="22"/></w:rPr></w:rPrDefault></w:docDefaults><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style></w:styles>';
+    return zipStore([
+      { nom: "[Content_Types].xml", bytes: enc.encode(contentTypes) },
+      { nom: "_rels/.rels", bytes: enc.encode(rels) },
+      { nom: "word/document.xml", bytes: enc.encode(documentXml) },
+      { nom: "word/_rels/document.xml.rels", bytes: enc.encode(docRels) },
+      { nom: "word/styles.xml", bytes: enc.encode(styles) },
+    ]);
+  }
+
   return { pad, toISODate, parseISODate, daysInMonth, todayISO, addOneMonth, addDays, diffDays, formatDateFR,
     assertMontant, formatMontant, soldePeriode, statutPeriode, LIBELLES_STATUT, numeroRecu,
-    validerEleve, validerPaiement, rappelsDus, pdfEscape, genererPDF, lignesRecu, checksum, validerSauvegarde, genererICS };
+    validerEleve, validerPaiement, rappelsDus, pdfEscape, genererPDF, lignesRecu, checksum, validerSauvegarde, genererICS,
+    calculerEcheance, validerSeance, statsSeances, bilanMensuel, genererDOCX };
 });

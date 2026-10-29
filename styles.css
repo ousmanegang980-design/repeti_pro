@@ -35,7 +35,7 @@ h1{font-size:1.35rem;margin:6px 0 14px}h2{font-size:1.02rem;margin:0 0 10px}
 .badge{font-size:.72rem;padding:3px 8px;border-radius:999px;white-space:nowrap}
 .b-payee{background:#DCFCE7;color:var(--green)}.b-en_retard,.b-partiel_en_retard{background:#FEE2E2;color:var(--red)}
 .b-aujourd_hui{background:#FEF3C7;color:var(--orange)}.b-partiel{background:#FEF3C7;color:var(--orange)}
-.b-a_venir{background:#E0F2FE;color:#075985}.b-suspendue,.b-annulee{background:#E5E7EB;color:#374151}
+.b-a_venir,.b-en_cours,.b-prevue{background:#E0F2FE;color:#075985}.b-faite{background:#DCFCE7;color:var(--green)}.b-absent{background:#FEE2E2;color:var(--red)}.b-suspendue,.b-annulee{background:#E5E7EB;color:#374151}
 .b-actif{background:#DCFCE7;color:var(--green)}.b-archive{background:#E5E7EB;color:#374151}.b-annule{background:#FEE2E2;color:var(--red)}
 .empty{background:#fff;border:1px dashed var(--line);border-radius:var(--radius);padding:26px 16px;text-align:center;color:var(--muted)}
 .empty .big{font-size:2rem}
