@@ -11,8 +11,8 @@ const CYCLES = { primaire: "Primaire", college: "Collège", lycee: "Lycée" };
 const STATUTS_SEANCE = { prevue: "Prévue", faite: "Faite (présent)", absent: "Absent", annulee: "Annulée" };
 
 /* ---------------- IndexedDB ---------------- */
-const DB_NAME = "repetipro", DB_VERSION = 2;
-const STORES = ["eleves", "repetitions", "periodes", "paiements", "recus", "seances", "syncops", "meta"];
+const DB_NAME = "repetipro", DB_VERSION = 3;
+const STORES = ["eleves", "repetitions", "periodes", "paiements", "recus", "seances", "documents", "syncops", "meta"];
 let db = null;
 function openDB() {
   return new Promise((res, rej) => {
@@ -41,13 +41,13 @@ async function putOne(store, obj) { await tx([store], "readwrite", (s) => s.put(
 async function getOne(store, id) { return await tx([store], "readonly", (s) => reqP(s.get(id))); }
 
 /* ---------------- État + paramètres ---------------- */
-let S = { eleves: [], repetitions: [], periodes: [], paiements: [], recus: [], seances: [], syncops: [] };
+let S = { eleves: [], repetitions: [], periodes: [], paiements: [], recus: [], seances: [], documents: [], syncops: [] };
 let settings = { id: "settings", activite: "", slogan: "", telephone: "", coordonnees: "", devise: "FCFA", formatRecu: "A4",
-  notifAvant: true, notifJourJ: true, notifApres: true, delaiApres: 2, rappelsVus: [] };
+  notifAvant: true, notifJourJ: true, notifApres: true, delaiApres: 2, rappelsVus: [], iaFournisseur: "aucun", iaCle: "", iaModele: "" };
 let currentView = "dashboard", currentEleveId = null, filtreEcheance = "aujourdhui", submitting = false;
 
 async function reload() {
-  for (const k of ["eleves", "repetitions", "periodes", "paiements", "recus", "seances", "syncops"]) S[k] = await allOf(k);
+  for (const k of ["eleves", "repetitions", "periodes", "paiements", "recus", "seances", "documents", "syncops"]) S[k] = await allOf(k);
   const st = await getOne("meta", "settings");
   if (st) settings = Object.assign(settings, st);
 }
@@ -122,7 +122,7 @@ function showView(name) {
 async function refresh() { await reload(); render(); verifierRappels(); }
 function render() {
   ({ dashboard: renderDashboard, eleves: renderEleves, fiche: renderFiche, echeances: renderEcheances,
-     paiements: renderPaiements, recus: renderRecus, rapports: renderRapports, synchro: renderSynchro,
+     paiements: renderPaiements, recus: renderRecus, rapports: renderRapports, synchro: renderSynchro, biblio: renderBiblio,
      parametres: renderParams }[currentView] || renderDashboard)();
 }
 
@@ -883,12 +883,34 @@ function renderSynchro() {
     derniers.map((o) => `<tr><td>${L.formatDateFR(o.updatedAt.slice(0, 10))}</td><td>${esc(o.operation)} ${esc(o.typeEntite)}</td><td>${esc(o.statut)}</td></tr>`).join("") + "</table>"
     : '<p class="hint">Aucune opération pour le moment. Chaque création/modification sera journalisée ici.</p>';
 }
+function blobToBase64(blob) {
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(String(r.result).split(",")[1] || "");
+    r.onerror = () => rej(r.error);
+    r.readAsDataURL(blob);
+  });
+}
+function base64ToBlob(b64, type) {
+  try {
+    const bin = atob(b64 || ""); const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new Blob([bytes], { type: type || "application/octet-stream" });
+  } catch { return null; }
+}
 async function exporterSauvegarde() {
   await reload();
-  const data = { eleves: S.eleves, repetitions: S.repetitions, periodes: S.periodes, paiements: S.paiements, recus: S.recus, seances: S.seances, settings };
+  const settingsExport = { ...settings }; delete settingsExport.iaCle; // la clé IA ne quitte jamais l'appareil
+  const documents = [];
+  for (const d of S.documents) {
+    const copie = { ...d }; delete copie.fichier;
+    if (d.fichier) { try { copie.fichierBase64 = await blobToBase64(d.fichier); } catch { copie.fichierBase64 = ""; } }
+    documents.push(copie);
+  }
+  const data = { eleves: S.eleves, repetitions: S.repetitions, periodes: S.periodes, paiements: S.paiements, recus: S.recus, seances: S.seances, documents, settings: settingsExport };
   const sauvegarde = { app: "RépétiPro", version: 1, exporteLe: nowISO(), data, checksum: L.checksum(JSON.stringify(data)) };
   download(new Blob([JSON.stringify(sauvegarde, null, 2)], { type: "application/json" }), "repetipro-sauvegarde-" + L.todayISO() + ".json");
-  toast("Sauvegarde exportée. Conservez-la en lieu sûr (ex. Google Drive).");
+  toast("Sauvegarde exportée (bibliothèque incluse, clé IA exclue). Conservez-la en lieu sûr (ex. Google Drive).");
 }
 async function importerSauvegarde(fichier) {
   const zone = $("#importResultat");
@@ -904,6 +926,7 @@ async function importerSauvegarde(fichier) {
     const parNom = Object.fromEntries(STORES.map((n, i) => [n, stores[i]]));
     for (const k of ["eleves", "repetitions", "periodes", "paiements", "recus"]) { parNom[k].clear(); for (const item of obj.data[k]) parNom[k].put(item); }
     parNom.seances.clear(); for (const item of obj.data.seances || []) parNom.seances.put(item);
+    parNom.documents.clear(); for (const item of obj.data.documents || []) { const copie = { ...item }; if (copie.fichierBase64) { copie.fichier = base64ToBlob(copie.fichierBase64, copie.typeFichier); delete copie.fichierBase64; } parNom.documents.put(copie); }
     if (obj.data.settings) parNom.meta.put(obj.data.settings);
     const maxSeq = obj.data.recus.reduce((m, r) => Math.max(m, parseInt((r.numero.split("-")[2] || "0"), 10) || 0), 0);
     parNom.meta.put({ id: "compteurRecu", valeur: maxSeq });
@@ -921,12 +944,241 @@ async function marquerSynchronise() {
   toast("Journal mis à jour."); await refresh();
 }
 
+/* ---------------- Bibliothèque documentaire & assistant IA ---------------- */
+const TYPES_DOC = { programme: "Programme", cours: "Cours", exercice: "Exercice", corrige: "Corrigé", evaluation: "Évaluation", contenu_ia: "Contenu IA (à vérifier)", autre: "Autre" };
+const LIBELLES_STATUT_TEXTE = { extrait: "✅ Texte extrait automatiquement", manuel: "✍️ Texte saisi ou collé", sans_texte: "⚠️ Sans texte (recherche et IA limitées)", erreur: "❌ Extraction en erreur" };
+let docEnAttente = null;
+
+function rendreOptionsDocs(selectId) {
+  const sel = $(selectId); const actuel = sel.value;
+  sel.innerHTML = `<option value="">— Aucun —</option>` + S.documents.map((d) => `<option value="${d.id}">${esc(d.titre)}</option>`).join("");
+  if ([...sel.options].some((o) => o.value === actuel)) sel.value = actuel;
+}
+function renderBiblio() {
+  const avecTexte = S.documents.filter((d) => (d.texteExtrait || "").trim()).length;
+  $("#biblioStats").innerHTML = `<p><strong>${S.documents.length} document(s)</strong> · ${avecTexte} avec texte exploitable par la recherche et l'IA.</p>`;
+  const selE = $("#iaEleve"); const actuelE = selE.value;
+  selE.innerHTML = `<option value="">— Aucun élève précis —</option>` + S.eleves.filter((e) => e.statut !== "archive").map((e) => `<option value="${e.id}">${esc(e.nomComplet)} (${esc(e.classe || "")})</option>`).join("");
+  if ([...selE.options].some((o) => o.value === actuelE)) selE.value = actuelE;
+  rendreOptionsDocs("#iaDocJoint");
+  const q = L.normaliserRecherche($("#rechercheDoc").value || "");
+  const type = $("#filtreTypeDoc").value;
+  const docs = [...S.documents]
+    .filter((d) => !type || d.typeDoc === type)
+    .filter((d) => !q || L.normaliserRecherche([d.titre, d.classe, d.matière, d.chapitre, d.texteExtrait].join(" ")).includes(q))
+    .sort((a, b) => (b.majLe || "").localeCompare(a.majLe || ""));
+  $("#listeDocs").innerHTML = docs.length ? docs.map((d) => `
+    <article class="card stack">
+      <h3>${esc(d.titre)}</h3>
+      <p class="hint">${esc(TYPES_DOC[d.typeDoc] || "Autre")}${d.classe ? " · " + esc(d.classe) : ""}${d.matière ? " · " + esc(d.matière) : ""}${d.chapitre ? " · " + esc(d.chapitre) : ""}<br>
+      ${esc(LIBELLES_STATUT_TEXTE[d.statutTexte] || "")}${d.nomFichier ? `<br>📎 ${esc(d.nomFichier)}` : ""}</p>
+      <div class="row"><button class="btn btn-light" type="button" data-doc-open="${d.id}">📄 Ouvrir / modifier</button></div>
+    </article>`).join("")
+    : `<p class="hint">Aucun document ${q || type ? "ne correspond à ce filtre" : "pour le moment. Importez votre premier cours avec le bouton « Importer un fichier »"}.</p>`;
+  for (const b of document.querySelectorAll("[data-doc-open]"))
+    b.addEventListener("click", () => { const d = S.documents.find((x) => x.id === b.dataset.docOpen); if (d) formDocument(d); });
+}
+
+function formDocument(doc) {
+  const d = doc || {};
+  const options = Object.entries(TYPES_DOC).map(([v, l]) => `<option value="${v}" ${d.typeDoc === v ? "selected" : ""}>${l}</option>`).join("");
+  openModal(doc ? "Document" : "Nouveau document", `<form id="fDoc">
+    <div id="docErreurs"></div>
+    <p class="hint" id="docFichierInfo">${doc && doc.nomFichier ? "📎 Fichier conservé : " + esc(doc.nomFichier) : ""}</p>
+    <label class="field">Titre *<input class="input" id="dTitre" value="${esc(d.titre || "")}" placeholder="Ex : Cours — Nombres relatifs"></label>
+    <label class="field">Type<select class="input" id="dType">${options}</select></label>
+    <div class="row">
+      <label class="field">Classe<input class="input" id="dClasse" value="${esc(d.classe || "")}" placeholder="Ex : 4e, Terminale…"></label>
+      <label class="field">Matière<input class="input" id="dMatière" value="${esc(d.matière || "")}" placeholder="Ex : Mathématiques"></label>
+    </div>
+    <label class="field">Chapitre<input class="input" id="dChapitre" value="${esc(d.chapitre || "")}" placeholder="Ex : Addition des nombres relatifs"></label>
+    <label class="field">Source / notes<input class="input" id="dSource" value="${esc(d.source || "")}" placeholder="Ex : manuel, document personnel…"></label>
+    <label class="field">Texte du document (utilisé par la recherche et l'IA — vérifiez-le)
+      <textarea class="input" id="dTexte" rows="10" placeholder="Texte extrait automatiquement pour les TXT/DOCX. Pour un PDF ou une photo, collez ou écrivez le texte ici.">${esc(d.texteExtrait || "")}</textarea></label>
+    <p class="hint">${esc(LIBELLES_STATUT_TEXTE[d.statutTexte] || "")}</p>
+    ${doc && doc.fichier ? `<div class="row"><button class="btn btn-light" type="button" id="btnOuvrirFichier">👁️ Voir le fichier original</button>
+      <button class="btn btn-light" type="button" id="btnTelechargerFichier">⬇️ Télécharger l'original</button></div>` : ""}
+    <div class="row"><button class="btn btn-primary" type="submit">Enregistrer le document</button>
+    ${doc ? `<button class="btn btn-danger" type="button" id="btnSupprDoc">Supprimer</button>` : ""}</div></form>`);
+  $("#fDoc").addEventListener("submit", async (e) => { e.preventDefault();
+    const texte = $("#dTexte").value;
+    const record = { ...(doc || {}), id: doc ? doc.id : uid(),
+      titre: $("#dTitre").value.trim(), typeDoc: $("#dType").value, classe: $("#dClasse").value.trim(),
+      matière: $("#dMatière").value.trim(), chapitre: $("#dChapitre").value.trim(), source: $("#dSource").value.trim(),
+      texteExtrait: texte, creeLe: doc ? doc.creeLe : nowISO(), majLe: nowISO() };
+    const errs = L.validerDocument(record);
+    if (errs.length) { $("#docErreurs").innerHTML = erreursHtml(errs); return; }
+    let statut = doc ? (doc.statutTexte || "manuel") : (docEnAttente ? docEnAttente.statutTexte : "manuel");
+    if (!texte.trim()) statut = "sans_texte"; else if (statut === "sans_texte" || statut === "erreur") statut = "manuel";
+    record.statutTexte = statut;
+    if (!doc && docEnAttente) {
+      record.fichier = docEnAttente.fichier; record.nomFichier = docEnAttente.nomFichier;
+      record.typeFichier = docEnAttente.typeFichier; record.tailleFichier = docEnAttente.tailleFichier;
+    }
+    await putOne("documents", record);
+    await logSync("document", record.id, doc ? "modification" : "création");
+    docEnAttente = null;
+    toast("Document enregistré dans la bibliothèque."); closeModal(); await refresh();
+  });
+  if (doc && doc.fichier) {
+    $("#btnOuvrirFichier").addEventListener("click", () => {
+      const url = URL.createObjectURL(doc.fichier); window.open(url, "_blank");
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+    });
+    $("#btnTelechargerFichier").addEventListener("click", () => download(doc.fichier, doc.nomFichier || "document"));
+  }
+  if (doc) $("#btnSupprDoc").addEventListener("click", async () => {
+    const ok = await confirmBox("Supprimer ce document ?", `« ${esc(doc.titre)} » et son fichier seront supprimés de cet appareil. Pensez à exporter une sauvegarde avant si besoin.`, "Oui, supprimer");
+    if (!ok) return;
+    await tx(["documents"], "readwrite", (s) => s.delete(doc.id));
+    await logSync("document", doc.id, "suppression");
+    toast("Document supprimé."); closeModal(); await refresh();
+  });
+}
+
+async function inflateRaw(octets) {
+  if (!("DecompressionStream" in window)) throw new Error("Ce navigateur ne sait pas décompresser les DOCX.");
+  const flux = new Blob([octets]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+  return new Uint8Array(await new Response(flux).arrayBuffer());
+}
+async function lireEntreeZip(buffer, nomVise) {
+  const vue = new DataView(buffer); const octets = new Uint8Array(buffer);
+  let eocd = -1;
+  for (let i = octets.length - 22; i >= 0; i--) if (vue.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  if (eocd < 0) throw new Error("Fichier ZIP/DOCX illisible.");
+  const total = vue.getUint16(eocd + 10, true); let off = vue.getUint32(eocd + 16, true);
+  for (let n = 0; n < total; n++) {
+    if (vue.getUint32(off, true) !== 0x02014b50) break;
+    const methode = vue.getUint16(off + 10, true), tailleComp = vue.getUint32(off + 20, true);
+    const lenNom = vue.getUint16(off + 28, true), lenExtra = vue.getUint16(off + 30, true), lenCom = vue.getUint16(off + 32, true);
+    const offLocal = vue.getUint32(off + 42, true);
+    const nom = new TextDecoder().decode(octets.slice(off + 46, off + 46 + lenNom));
+    if (nom === nomVise) {
+      const debut = offLocal + 30 + vue.getUint16(offLocal + 26, true) + vue.getUint16(offLocal + 28, true);
+      const comp = octets.slice(debut, debut + tailleComp);
+      const data = methode === 0 ? comp : await inflateRaw(comp);
+      return new TextDecoder("utf-8").decode(data);
+    }
+    off += 46 + lenNom + lenExtra + lenCom;
+  }
+  throw new Error("Contenu Word introuvable dans ce fichier.");
+}
+async function extraireTexteFichier(fichier) {
+  const nom = (fichier.name || "").toLowerCase();
+  try {
+    if (nom.endsWith(".txt") || nom.endsWith(".md") || (fichier.type || "").startsWith("text/"))
+      return { texte: await fichier.text(), statut: "extrait" };
+    if (nom.endsWith(".docx")) {
+      const xml = await lireEntreeZip(await fichier.arrayBuffer(), "word/document.xml");
+      const texte = L.extraireTexteDOCXxml(xml);
+      return { texte, statut: texte ? "extrait" : "sans_texte" };
+    }
+  } catch (e) { return { texte: "", statut: "erreur", erreur: e.message }; }
+  return { texte: "", statut: "sans_texte" };
+}
+async function importerFichierDoc(fichier) {
+  if (fichier.size > 30 * 1024 * 1024) { toast("Fichier trop volumineux (maximum 30 Mo) pour le stockage local.", true); return; }
+  const { texte, statut, erreur } = await extraireTexteFichier(fichier);
+  docEnAttente = { fichier, nomFichier: fichier.name, typeFichier: fichier.type || "application/octet-stream", tailleFichier: fichier.size, statutTexte: statut };
+  formDocument(null);
+  $("#dTitre").value = (fichier.name || "Document").replace(/\.[^.]+$/, "");
+  $("#dTexte").value = texte;
+  $("#docFichierInfo").textContent = "📎 Fichier à conserver : " + fichier.name;
+  if (statut === "sans_texte") toast("Fichier prêt à être conservé. Son texte n'est pas extrait automatiquement : collez-le dans le champ « Texte du document » pour la recherche et l'IA.");
+  if (statut === "erreur") toast("Extraction du texte impossible : " + erreur + " Le fichier peut quand même être conservé.", true);
+}
+
+function contexteEleveIA(eleveId) {
+  if (!eleveId) return "";
+  const e = S.eleves.find((x) => x.id === eleveId); if (!e) return "";
+  const diffs = S.seances.filter((s) => s.eleveId === eleveId && s.statut === "faite" && s.difficultes)
+    .sort((a, b) => b.date.localeCompare(a.date)).slice(0, 3).map((s) => s.difficultes);
+  return `Élève de ${e.classe || "classe non précisée"}.` + (diffs.length ? ` Difficultés récentes notées par l'enseignant : ${diffs.join(" ; ")}` : "");
+}
+function preparerPromptIA() {
+  const demande = $("#iaDemande").value.trim();
+  const docJoint = S.documents.find((d) => d.id === $("#iaDocJoint").value);
+  const texteJoint = docJoint ? (docJoint.texteExtrait || "").trim() : "";
+  if (!demande && !texteJoint) { toast("Écrivez votre demande (ou joignez un document avec du texte) avant de préparer.", true); return ""; }
+  const requete = [demande, docJoint ? docJoint.chapitre : "", docJoint ? docJoint.matière : ""].join(" ");
+  const passages = L.rechercherPassages(S.documents.filter((d) => !docJoint || d.id !== docJoint.id), requete, 5);
+  $("#iaSources").innerHTML = passages.length
+    ? `<p class="hint">📚 Passages de vos cours qui seront joints :<br>${passages.map((p, i) => `${i + 1}. ${esc(p.titre)}`).join("<br>")}</p>`
+    : `<p class="hint">Aucun passage pertinent trouvé dans votre bibliothèque : la demande dira à l'IA de le signaler et de répondre en connaissances générales.</p>`;
+  const prompt = L.construirePromptIA({ mode: $("#iaMode").value, demande,
+    contexte: contexteEleveIA($("#iaEleve").value),
+    enonceJoint: texteJoint ? `(${docJoint.titre})\n${texteJoint}` : "", passages });
+  $("#iaPrompt").value = prompt;
+  toast("Demande préparée avec vos cours. Copiez-la ou utilisez « Demander à l'IA » si votre clé est configurée.");
+  return prompt;
+}
+function messageErreurIA(status, data) {
+  const detail = (data && data.error && data.error.message) || "";
+  if (status === 401 || status === 403) return `clé refusée (${status}). Vérifiez votre clé dans Paramètres → Assistant IA.`;
+  if (status === 429) return "quota gratuit atteint (429). Réessayez plus tard ou changez de modèle.";
+  if (status === 400) return "demande refusée (400) : " + detail;
+  return "erreur " + status + (detail ? " : " + detail : "");
+}
+async function demanderIA() {
+  const etat = $("#iaEtat");
+  const prompt = $("#iaPrompt").value.trim() || preparerPromptIA();
+  if (!prompt) return;
+  const f = settings.iaFournisseur;
+  if (!f || f === "aucun" || !settings.iaCle) { toast("Aucune clé IA configurée : allez dans Paramètres → Assistant IA pour coller votre clé gratuite, ou copiez la demande vers l'IA de votre choix.", true); return; }
+  if (!navigator.onLine) { toast("Vous semblez hors ligne : l'IA nécessite Internet. Votre bibliothèque reste consultable hors ligne.", true); return; }
+  etat.innerHTML = `<p class="hint">⏳ Envoi à l'IA en cours…</p>`;
+  try {
+    let texte = "";
+    const docJoint = S.documents.find((d) => d.id === $("#iaDocJoint").value);
+    if (f === "gemini") {
+      const modele = settings.iaModele || "gemini-3.8-flash";
+      const parts = [{ text: prompt }];
+      if (docJoint && docJoint.fichier && String(docJoint.typeFichier || "").startsWith("image/"))
+        parts.push({ inlineData: { mimeType: docJoint.typeFichier, data: await blobToBase64(docJoint.fichier) } });
+      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modele)}:generateContent`,
+        { method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": settings.iaCle }, body: JSON.stringify({ contents: [{ parts }] }) });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(messageErreurIA(r.status, data));
+      texte = (((data.candidates || [])[0] || {}).content?.parts || []).map((p) => p.text || "").join("\n");
+    } else {
+      const modele = settings.iaModele || "openrouter/free";
+      const r = await fetch("https://openrouter.ai/api/v1/chat/completions",
+        { method: "POST", headers: { "Content-Type": "application/json", "Authorization": "Bearer " + settings.iaCle },
+          body: JSON.stringify({ model: modele, messages: [{ role: "user", content: prompt }] }) });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(messageErreurIA(r.status, data));
+      const c = ((data.choices || [])[0] || {}).message?.content;
+      texte = typeof c === "string" ? c : "";
+    }
+    if (!texte.trim()) throw new Error("réponse vide du fournisseur. Réessayez ou changez de modèle dans les paramètres.");
+    $("#iaReponse").value = texte;
+    etat.innerHTML = `<p class="hint">✅ Réponse reçue. Vérifiez-la attentivement avant de l'enregistrer ou de l'utiliser.</p>`;
+  } catch (e) {
+    etat.innerHTML = "";
+    toast("IA : " + e.message, true);
+  }
+}
+async function sauverReponseIA() {
+  const texte = $("#iaReponse").value.trim();
+  if (!texte) { toast("Aucune réponse à enregistrer pour le moment.", true); return; }
+  const modes = { resoudre: "Résolution", corriger: "Correction", expliquer: "Explication", generer: "Exercices générés", lecon: "Leçon", evaluation: "Évaluation" };
+  const doc = { id: uid(), titre: (modes[$("#iaMode").value] || "Contenu IA") + " — " + L.formatDateFR(L.todayISO()),
+    typeDoc: "contenu_ia", classe: "", matière: "", chapitre: "", source: "Assistant IA (à vérifier par l'enseignant)",
+    texteExtrait: texte, statutTexte: "manuel", creeLe: nowISO(), majLe: nowISO() };
+  await putOne("documents", doc);
+  await logSync("document", doc.id, "création");
+  toast("Réponse enregistrée dans la bibliothèque (pensez à la vérifier)."); await refresh();
+}
+
 /* ---------------- J. Paramètres ---------------- */
 function renderParams() {
   $("#pActivite").value = settings.activite; $("#pSlogan").value = settings.slogan || ""; $("#pTel").value = settings.telephone; $("#pCoords").value = settings.coordonnees;
   $("#pDevise").value = settings.devise; $("#pFormat").value = settings.formatRecu;
   $("#pNotifAvant").checked = settings.notifAvant; $("#pNotifJourJ").checked = settings.notifJourJ;
   $("#pNotifApres").checked = settings.notifApres; $("#pDelaiApres").value = settings.delaiApres;
+  $("#pIaFournisseur").value = settings.iaFournisseur || "aucun";
+  $("#pIaCle").value = settings.iaCle || "";
+  $("#pIaModele").value = settings.iaModele || "";
 }
 
 /* ---------------- Rappels (locaux, anti-doublons) ---------------- */
@@ -1057,13 +1309,31 @@ $("#moisRapport").addEventListener("change", renderRapports);
 $("#btnCsv").addEventListener("click", exporterCSV);
 $("#btnRapportPdf").addEventListener("click", exporterRapportPDF);
 $("#btnExport").addEventListener("click", exporterSauvegarde);
+$("#fileDoc").addEventListener("change", (e) => { if (e.target.files[0]) importerFichierDoc(e.target.files[0]); e.target.value = ""; });
+$("#btnNouveauDocTexte").addEventListener("click", () => { docEnAttente = null; formDocument(null); });
+$("#rechercheDoc").addEventListener("input", renderBiblio);
+$("#filtreTypeDoc").addEventListener("change", renderBiblio);
+$("#btnPreparerIA").addEventListener("click", preparerPromptIA);
+$("#btnCopierPrompt").addEventListener("click", async () => {
+  const t = $("#iaPrompt").value;
+  if (!t.trim()) { toast("Préparez d'abord la demande avec le bouton de recherche.", true); return; }
+  try { await navigator.clipboard.writeText(t); toast("Demande copiée. Collez-la dans l'IA de votre choix."); }
+  catch { $("#iaPrompt").select(); toast("Texte sélectionné : copiez-le manuellement."); }
+});
+$("#btnTelechargerPrompt").addEventListener("click", () => {
+  const t = $("#iaPrompt").value;
+  if (!t.trim()) { toast("Préparez d'abord la demande avec le bouton de recherche.", true); return; }
+  download(new Blob([t], { type: "text/plain;charset=utf-8" }), "demande-ia-" + L.todayISO() + ".txt");
+});
+$("#btnDemanderIA").addEventListener("click", demanderIA);
+$("#btnSauverReponseIA").addEventListener("click", sauverReponseIA);
 $("#btnMarquerSync").addEventListener("click", marquerSynchronise);
 $("#fileImport").addEventListener("change", (e) => { if (e.target.files[0]) importerSauvegarde(e.target.files[0]); e.target.value = ""; });
 $("#formParams").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   Object.assign(settings, { activite: $("#pActivite").value.trim(), slogan: $("#pSlogan").value.trim(), telephone: $("#pTel").value.trim(), coordonnees: $("#pCoords").value.trim(),
     devise: $("#pDevise").value.trim() || "FCFA", formatRecu: $("#pFormat").value, notifAvant: $("#pNotifAvant").checked,
-    notifJourJ: $("#pNotifJourJ").checked, notifApres: $("#pNotifApres").checked, delaiApres: Math.max(1, Number($("#pDelaiApres").value) || 2) });
+    notifJourJ: $("#pNotifJourJ").checked, notifApres: $("#pNotifApres").checked, delaiApres: Math.max(1, Number($("#pDelaiApres").value) || 2), iaFournisseur: $("#pIaFournisseur").value, iaCle: $("#pIaCle").value.trim(), iaModele: $("#pIaModele").value.trim() });
   await saveSettings(); toast("Paramètres enregistrés."); await refresh();
 });
 $("#btnNotif").addEventListener("click", async () => {

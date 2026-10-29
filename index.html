@@ -91,6 +91,64 @@
   </section>
 
   <!-- K. SAUVEGARDE & SYNCHRONISATION -->
+  <section class="view hidden" id="view-biblio">
+    <h1>Bibliothèque &amp; assistant IA</h1>
+    <div class="card stack">
+      <h2>Mes documents</h2>
+      <p class="hint">Importez vos programmes, cours, exercices et corrigés (PDF, DOCX, TXT, images). Ils restent sur cet appareil et sont consultables hors ligne.
+      Le texte des fichiers TXT et DOCX est extrait automatiquement ; pour les PDF et les photos, le fichier est conservé et vous pouvez coller ou écrire son texte dans le document : c'est ce texte qui sert à la recherche et à l'assistant IA.</p>
+      <div id="biblioStats"></div>
+      <div class="row">
+        <input id="rechercheDoc" class="input" type="search" placeholder="Rechercher (titre, matière, chapitre, contenu…)">
+        <select id="filtreTypeDoc" class="input">
+          <option value="">Tous les types</option>
+          <option value="programme">Programmes</option>
+          <option value="cours">Cours</option>
+          <option value="exercice">Exercices</option>
+          <option value="corrige">Corrigés</option>
+          <option value="evaluation">Évaluations</option>
+          <option value="contenu_ia">Contenus IA</option>
+          <option value="autre">Autres</option>
+        </select>
+      </div>
+      <div class="row">
+        <label class="btn btn-primary" for="fileDoc">📥 Importer un fichier</label>
+        <input id="fileDoc" class="hidden" type="file" accept=".pdf,.docx,.txt,.md,.jpg,.jpeg,.png,image/*">
+        <button class="btn btn-light" id="btnNouveauDocTexte" type="button">✍️ Nouveau document texte</button>
+      </div>
+      <div id="listeDocs" class="stack"></div>
+    </div>
+    <div class="card stack">
+      <h2>Assistant pédagogique (IA)</h2>
+      <p class="hint">L'assistant cherche d'abord dans <strong>vos cours ci-dessus</strong>, puis prépare une demande complète pour l'IA.
+      Sans clé configurée (Paramètres → Assistant IA), copiez la demande vers l'IA de votre choix puis collez sa réponse ci-dessous.
+      Avec une clé gratuite configurée, le bouton « Demander à l'IA » l'interroge directement (Internet requis). Vérifiez toujours le résultat avant de l'utiliser.</p>
+      <label class="field">Que voulez-vous faire ?
+        <select id="iaMode" class="input">
+          <option value="resoudre">Résoudre un exercice</option>
+          <option value="corriger">Corriger une réponse d'élève</option>
+          <option value="expliquer">Expliquer une notion / un chapitre</option>
+          <option value="generer">Générer des exercices similaires (+ corrigés)</option>
+          <option value="lecon">Préparer une leçon</option>
+          <option value="evaluation">Préparer une évaluation (+ barème)</option>
+        </select></label>
+      <label class="field">Élève concerné (facultatif)<select id="iaEleve" class="input"></select></label>
+      <label class="field">Document à joindre — exercice, copie… (facultatif)<select id="iaDocJoint" class="input"></select></label>
+      <label class="field">Votre demande / l'exercice / la notion
+        <textarea id="iaDemande" class="input" rows="5" placeholder="Ex : Résous cet exercice de 4e sur les nombres relatifs : (-5) + (+3) - (-2) = ?"></textarea></label>
+      <button class="btn btn-light" id="btnPreparerIA" type="button">🔎 Chercher dans mes cours et préparer la demande</button>
+      <div id="iaSources"></div>
+      <label class="field">Demande complète préparée (à envoyer à l'IA)<textarea id="iaPrompt" class="input" rows="8"></textarea></label>
+      <div class="row">
+        <button class="btn btn-light" id="btnCopierPrompt" type="button">📋 Copier la demande</button>
+        <button class="btn btn-light" id="btnTelechargerPrompt" type="button">⬇️ Télécharger (.txt)</button>
+        <button class="btn btn-primary" id="btnDemanderIA" type="button">🤖 Demander à l'IA (clé requise)</button>
+      </div>
+      <div id="iaEtat"></div>
+      <label class="field">Réponse de l'IA (à vérifier avant utilisation)<textarea id="iaReponse" class="input" rows="10" placeholder="La réponse apparaîtra ici, ou collez-la après l'avoir obtenue ailleurs."></textarea></label>
+      <button class="btn btn-light" id="btnSauverReponseIA" type="button">💾 Enregistrer cette réponse dans la bibliothèque</button>
+    </div>
+  </section>
   <section class="view hidden" id="view-synchro">
     <h1>Sauvegarde &amp; synchronisation</h1>
     <div class="card">
@@ -132,6 +190,18 @@
       <button class="btn btn-ghost" id="btnNotif" type="button">Autoriser les notifications du téléphone</button>
       <p class="hint">Les rappels s'affichent dans l'application à chaque ouverture, et en notification système si vous l'autorisez.
       Sur Android, l'économie de batterie peut retarder les notifications d'une application fermée : vérifiez l'écran « Échéances » régulièrement.</p>
+      <h2>Assistant IA (optionnel — gratuit avec votre propre clé)</h2>
+      <label class="field">Fournisseur IA
+        <select id="pIaFournisseur" class="input">
+          <option value="aucun">Aucun (mode copier-coller)</option>
+          <option value="gemini">Google Gemini — clé gratuite AI Studio</option>
+          <option value="openrouter">OpenRouter — modèles gratuits</option>
+        </select></label>
+      <label class="field">Votre clé API personnelle<input id="pIaCle" class="input" type="password" autocomplete="off" placeholder="Collez votre clé ici"></label>
+      <label class="field">Modèle (vide = défaut gratuit)<input id="pIaModele" class="input" placeholder="Gemini : gemini-3.8-flash · OpenRouter : openrouter/free"></label>
+      <p class="hint">Pour obtenir une clé gratuite : allez sur <strong>aistudio.google.com</strong> avec votre compte Google → « Create API key » (ou créez un compte gratuit sur <strong>openrouter.ai</strong>), puis collez la clé ci-dessus et enregistrez.
+      Elle reste <strong>uniquement sur cet appareil</strong> : ne la partagez jamais, ne l'envoyez à personne et ne la mettez jamais dans un code. Elle n'est pas incluse dans les sauvegardes (il faudra la recoller après une restauration).
+      Sans clé, l'assistant prépare simplement la demande à copier vers l'IA de votre choix. Ce que vous envoyez à l'IA part chez le fournisseur choisi : évitez d'y mettre les noms des élèves.</p>
       <button class="btn btn-primary" type="submit">Enregistrer les paramètres</button>
     </form>
     <div class="card stack">
@@ -157,6 +227,7 @@
 <div id="menuPlus" class="sheet hidden" role="dialog" aria-label="Menu Plus">
   <button data-nav="recus" type="button">🧾 Reçus</button>
   <button data-nav="rapports" type="button">📊 Rapports financiers</button>
+  <button data-nav="biblio" type="button">📚 Bibliothèque &amp; IA</button>
   <button data-nav="synchro" type="button">💾 Sauvegarde &amp; synchronisation</button>
   <button data-nav="parametres" type="button">⚙️ Paramètres</button>
   <button id="fermerPlus" type="button">Fermer</button>

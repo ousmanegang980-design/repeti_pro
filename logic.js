@@ -233,6 +233,10 @@
       else { const idsEleves = new Set(obj.data.eleves.map((e) => e.id));
         for (const s of obj.data.seances) if (!idsEleves.has(s.eleveId)) erreurs.push("Séance orpheline (élève introuvable) : " + s.id); }
     }
+    if (obj.data.documents != null) {
+      if (!Array.isArray(obj.data.documents)) erreurs.push("Section invalide : documents.");
+      else for (const d of obj.data.documents) if (!d.id || !d.titre) erreurs.push("Document invalide dans la sauvegarde : " + (d.id || "?"));
+    }
     const nums = obj.data.recus.map((r) => r.numero);
     if (new Set(nums).size !== nums.length) erreurs.push("Numéros de reçu en double détectés.");
     return erreurs;
@@ -372,8 +376,86 @@
     ]);
   }
 
+
+  /* ---------- Bibliothèque documentaire & assistant IA (phase 1) ---------- */
+  function normaliserRecherche(s) {
+    return String(s || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  }
+  function decouperPassages(texte, max) {
+    max = max || 1200;
+    const morceaux = String(texte || "").split(/\n+/).map((x) => x.trim()).filter(Boolean);
+    const out = []; let cur = "";
+    for (const m of morceaux) {
+      if (cur && (cur + "\n" + m).length > max) { out.push(cur); cur = m; }
+      else cur = cur ? cur + "\n" + m : m;
+      while (cur.length > max) { out.push(cur.slice(0, max)); cur = cur.slice(max); }
+    }
+    if (cur) out.push(cur);
+    return out;
+  }
+  function rechercherPassages(documents, requete, limite) {
+    limite = limite || 5;
+    const mots = [...new Set(normaliserRecherche(requete).split(/[^a-z0-9]+/).filter((w) => w.length >= 3))];
+    if (!mots.length) return [];
+    const res = [];
+    for (const d of documents || []) {
+      decouperPassages(d.texteExtrait || "").forEach((p, i) => {
+        const np = normaliserRecherche(p); let score = 0;
+        for (const m of mots) { let idx = 0; while ((idx = np.indexOf(m, idx)) >= 0) { score++; idx += m.length; } }
+        if (score > 0) res.push({ documentId: d.id, titre: d.titre || "Document", extrait: p, score, ordre: i + 1 });
+      });
+    }
+    return res.sort((a, b) => b.score - a.score).slice(0, limite);
+  }
+  function extraireTexteDOCXxml(xml) {
+    let t = String(xml || "");
+    t = t.replace(/<\/w:p>/g, "\n").replace(/<w:tab[^>]*>/g, "\t").replace(/<[^>]+>/g, "");
+    t = t.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, "&");
+    return t.split("\n").map((x) => x.trim()).filter(Boolean).join("\n");
+  }
+  function validerDocument(d) {
+    const e = [];
+    if (!d || !String(d.titre || "").trim()) e.push("Le titre du document est obligatoire.");
+    return e;
+  }
+  function construirePromptIA(o) {
+    o = o || {};
+    const modes = {
+      resoudre: "Résous cet exercice. Structure ta réponse ainsi : 1) Énoncé reconnu, 2) Données connues et ce qu'il faut trouver, 3) Notions et propriétés utiles, 4) Méthode choisie (celle du cours si elle figure dans les passages), 5) Résolution étape par étape avec les calculs intermédiaires, 6) Résultat final, 7) Vérification du résultat quand c'est possible, 8) Erreur fréquente à éviter.",
+      corriger: "Corrige ce travail d'élève en analysant le raisonnement, pas seulement le résultat : étapes correctes, erreurs précises et pourquoi elles sont fausses, correction proposée, conseil de remédiation et un petit exercice ciblé. Ne mets pas de note définitive : propose seulement une appréciation que l'enseignant validera.",
+      expliquer: "Explique cette notion simplement et progressivement : idée principale, définitions et propriétés, exemple détaillé pas à pas, erreurs fréquentes, puis deux questions de vérification avec réponses.",
+      generer: "Crée des exercices similaires progressifs (facile, moyen, difficile) qui travaillent les mêmes compétences en variant les données et les formulations. Donne d'abord les énoncés seuls, puis les corrigés complets séparément, avec un barème.",
+      lecon: "Prépare une fiche de leçon structurée : titre, objectifs, prérequis, introduction, explication progressive, définitions et propriétés, formules utiles, exemples détaillés, erreurs fréquentes, exercices d'application, synthèse et questions de vérification.",
+      evaluation: "Prépare une évaluation complète : sujet adapté au niveau, durée conseillée, barème par question, compétences évaluées. Présente d'abord le sujet seul (utilisable tel quel avec les élèves), puis le corrigé détaillé et la grille de correction, bien séparés.",
+    };
+    const consigne = modes[o.mode] || modes.expliquer;
+    const passages = o.passages || [];
+    const blocSources = passages.length
+      ? passages.map((p, i) => `[Source ${i + 1} — ${p.titre}]\n${p.extrait}`).join("\n\n")
+      : "(Aucun passage de mes cours n'a été fourni pour cette demande.)";
+    const lignes = [
+      "Tu es un assistant pédagogique qui aide un enseignant. Réponds en français, clairement, au niveau de la classe concernée.",
+      "TÂCHE : " + consigne,
+    ];
+    if (o.contexte) lignes.push("CONTEXTE : " + o.contexte);
+    lignes.push("DEMANDE DE L'ENSEIGNANT :\n" + String(o.demande || "").trim());
+    if (o.enonceJoint && String(o.enonceJoint).trim()) lignes.push("DOCUMENT JOINT (exercice, copie ou texte à traiter) :\n" + String(o.enonceJoint).trim());
+    lignes.push("PASSAGES DE MES COURS (à privilégier) :\n" + blocSources);
+    lignes.push([
+      "RÈGLES IMPORTANTES :",
+      "- Appuie-toi d'abord sur les passages de cours ci-dessus et cite la source utilisée (par ex. [Source 1]) quand tu t'en sers.",
+      "- Si l'information nécessaire n'est pas dans les passages, dis-le clairement, puis donne éventuellement une explication générale en l'identifiant comme telle.",
+      "- N'invente jamais de citation, de numéro de page ou de référence qui ne figure pas ci-dessus.",
+      "- Si un énoncé est ambigu ou semble mal transcrit, signale l'ambiguïté au lieu d'inventer les données manquantes.",
+      "- Vérifie les calculs, les signes et les unités avant de donner le résultat final.",
+      "- Termine par : « À vérifier par l'enseignant avant utilisation. »",
+    ].join("\n"));
+    return lignes.join("\n\n");
+  }
+
   return { pad, toISODate, parseISODate, daysInMonth, todayISO, addOneMonth, addDays, diffDays, formatDateFR,
     assertMontant, formatMontant, soldePeriode, statutPeriode, LIBELLES_STATUT, numeroRecu,
     validerEleve, validerPaiement, rappelsDus, pdfEscape, genererPDF, lignesRecu, checksum, validerSauvegarde, genererICS,
-    calculerEcheance, validerSeance, statsSeances, bilanMensuel, genererDOCX };
+    calculerEcheance, validerSeance, statsSeances, bilanMensuel, genererDOCX,
+    normaliserRecherche, decouperPassages, rechercherPassages, extraireTexteDOCXxml, validerDocument, construirePromptIA };
 });
