@@ -1116,6 +1116,8 @@ function messageErreurIA(status, data) {
   const detail = (data && data.error && data.error.message) || "";
   if (status === 401 || status === 403) return `clé refusée (${status}). Vérifiez votre clé dans Paramètres → Assistant IA.`;
   if (status === 429) return "quota gratuit atteint (429). Réessayez plus tard ou changez de modèle.";
+  if (status === 404) return "modèle introuvable (404). Vide le champ « Modèle » dans Paramètres pour utiliser le modèle gratuit par défaut.";
+  if (status === 400 && /api key not valid/i.test(detail)) return "clé invalide (400). Recopie ta clé en entier depuis AI Studio, sans espace au début ni à la fin.";
   if (status === 400) return "demande refusée (400) : " + detail;
   return "erreur " + status + (detail ? " : " + detail : "");
 }
@@ -1154,8 +1156,36 @@ async function demanderIA() {
     $("#iaReponse").value = texte;
     etat.innerHTML = `<p class="hint">✅ Réponse reçue. Vérifiez-la attentivement avant de l'enregistrer ou de l'utiliser.</p>`;
   } catch (e) {
-    etat.innerHTML = "";
-    toast("IA : " + e.message, true);
+    if (/failed to fetch|networkerror|load failed/i.test(e.message)) {
+      etat.innerHTML = `<p class="hint">❌ <strong>Connexion impossible au fournisseur IA (« Failed to fetch »)</strong> : la demande n'est pas partie de l'appareil, ce n'est donc pas ta clé qui est refusée.<br>
+      Causes fréquentes : pas d'Internet réel, bloqueur de pubs / VPN / DNS privé qui bloque le fournisseur, ou application ouverte comme simple fichier téléchargé au lieu de son adresse https.<br>
+      Essaie : 1) ouvre l'application via son <strong>adresse https dans Chrome</strong>, 2) désactive bloqueur/VPN/DNS privé, 3) change de réseau (Wi-Fi ↔ données mobiles), 4) utilise le bouton « Tester ma clé » dans Paramètres → Assistant IA.</p>`;
+      toast("IA : connexion impossible (Failed to fetch). Voir les explications affichées.", true);
+    } else {
+      etat.innerHTML = "";
+      toast("IA : " + e.message, true);
+    }
+  }
+}
+async function testerCleIA() {
+  const zone = $("#iaTestResultat");
+  const f = $("#pIaFournisseur").value, cle = $("#pIaCle").value.trim();
+  if (!f || f === "aucun" || !cle) { zone.innerHTML = `<p class="hint">Choisis d'abord un fournisseur et colle ta clé ci-dessus.</p>`; return; }
+  zone.innerHTML = `<p class="hint">⏳ Test de connexion en cours…</p>`;
+  try {
+    let r;
+    if (f === "gemini") r = await fetch("https://generativelanguage.googleapis.com/v1beta/models?pageSize=3", { headers: { "x-goog-api-key": cle } });
+    else r = await fetch("https://openrouter.ai/api/v1/models", { headers: { "Authorization": "Bearer " + cle } });
+    const data = await r.json().catch(() => ({}));
+    if (r.ok) {
+      const noms = f === "gemini" ? (data.models || []).map((m) => String(m.name || "").replace("models/", "")).slice(0, 3).join(", ")
+                                  : (data.data || []).map((m) => m.id).slice(0, 3).join(", ");
+      zone.innerHTML = `<p class="hint">✅ <strong>Connexion réussie et clé acceptée</strong> (${f === "gemini" ? "Gemini" : "OpenRouter"}). Exemples de modèles visibles : ${esc(noms || "—")}.<br>N'oublie pas de toucher « Enregistrer les paramètres » ci-dessous pour conserver la clé.</p>`;
+    } else {
+      zone.innerHTML = `<p class="hint">❌ Le fournisseur a répondu : ${esc(messageErreurIA(r.status, data))}</p>`;
+    }
+  } catch (e) {
+    zone.innerHTML = `<p class="hint">❌ <strong>Connexion impossible</strong> (${esc(e.message)}). Vérifie Internet, désactive bloqueur de pubs/VPN/DNS privé, et ouvre l'application via son adresse https dans Chrome (pas comme fichier téléchargé).</p>`;
   }
 }
 async function sauverReponseIA() {
@@ -1326,6 +1356,7 @@ $("#btnTelechargerPrompt").addEventListener("click", () => {
   download(new Blob([t], { type: "text/plain;charset=utf-8" }), "demande-ia-" + L.todayISO() + ".txt");
 });
 $("#btnDemanderIA").addEventListener("click", demanderIA);
+$("#btnTesterIA").addEventListener("click", testerCleIA);
 $("#btnSauverReponseIA").addEventListener("click", sauverReponseIA);
 $("#btnMarquerSync").addEventListener("click", marquerSynchronise);
 $("#fileImport").addEventListener("change", (e) => { if (e.target.files[0]) importerSauvegarde(e.target.files[0]); e.target.value = ""; });
